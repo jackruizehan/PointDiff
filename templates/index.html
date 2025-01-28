@@ -1,12 +1,12 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
     <title>Forex Point Spread Analysis</title>
     <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
     <style>
-        /* Optional: Add some basic styling for better presentation */
+        /* Basic styling */
         body {
             font-family: Arial, sans-serif;
             margin: 20px;
@@ -19,7 +19,7 @@
             width: 200px;
             margin-bottom: 10px;
         }
-        input {
+        input, select {
             padding: 5px;
             width: 200px;
         }
@@ -27,11 +27,14 @@
             padding: 10px 20px;
             margin-top: 10px;
         }
+
         #result img {
             max-width: 100%;
             height: auto;
             margin-bottom: 20px;
         }
+
+        /* Statistics table styling */
         #statistics {
             background-color: #f9f9f9;
             padding: 15px;
@@ -44,8 +47,9 @@
             margin-bottom: 10px;
         }
         .stat-section table {
-            width: 100%;
             border-collapse: collapse;
+            margin: 0 auto; /* center the table */
+            width: 400px;   /* fixed width */
         }
         .stat-section table, .stat-section th, .stat-section td {
             border: 1px solid #ccc;
@@ -53,31 +57,74 @@
         .stat-section th, .stat-section td {
             padding: 8px;
             text-align: left;
+            width: 50%;
         }
     </style>
 </head>
 <body>
     <h1>Forex Point Spread Analysis</h1>
     <form id="data-form">
+        <!-- Date -->
         <label for="date">Select Date:</label>
         <input type="date" id="date" name="date" required><br><br>
 
-        <label for="symbol">Enter Symbol:</label>
-        <input type="text" id="symbol" name="symbol" value="XAU/USD" required><br><br>
+        <!-- Symbol (dropdown) -->
+        <label for="symbol">Select Symbol:</label>
+        <select id="symbol" name="symbol" required>
+            <option value="AUD/CAD">AUD/CAD</option>
+            <option value="AUD/JPY">AUD/JPY</option>
+            <option value="AUD/USD">AUD/USD</option>
+            <option value="BTCUSD">BTCUSD</option>
+            <option value="CAD/JPY">CAD/JPY</option>
+            <option value="ETHUSD">ETHUSD</option>
+            <option value="EUR/GBP">EUR/GBP</option>
+            <option value="EUR/NZD">EUR/NZD</option>
+            <option value="EUR/SEK">EUR/SEK</option>
+            <option value="EUR/USD">EUR/USD</option>
+            <option value="EUR/ZAR">EUR/ZAR</option>
+            <option value="GBP/JPY">GBP/JPY</option>
+            <option value="GBP/USD">GBP/USD</option>
+            <option value="NASUSD">NASUSD</option>
+            <option value="NZD/USD">NZD/USD</option>
+            <option value="U30USD">U30USD</option>
+            <option value="USD/CAD">USD/CAD</option>
+            <option value="USD/CHF">USD/CHF</option>
+            <option value="USD/JPY">USD/JPY</option>
+            <option value="USOUSD">USOUSD</option>
+            <option value="XAG/USD">XAG/USD</option>
+            <option value="XAU/USD" selected>XAU/USD</option>
+            <option value="XNG/USD">XNG/USD</option>
+        </select><br><br>
 
-        <label for="trade_vol">Enter Trading Volume:</label>
-        <input type="number" id="trade_vol" name="trade_vol" value="300" required><br><br>
+        <!-- Trading Volume -->
+        <label for="trade_vol">Trading Volume:</label>
+        <input type="number" id="trade_vol" name="trade_vol" value="300"><br><br>
 
+        <!-- OR Top-of-Book checkbox -->
+        <label for="top_of_book">Or Top-of-Book:</label>
+        <input type="checkbox" id="top_of_book" name="top_of_book"/><br><br>
+
+        <!-- Market Maker (dropdown) -->
         <label for="maker_id">Select Market Maker:</label>
-        <input type="text" id="maker_id" name="maker_id" value="Britannia" required><br><br>
+        <select id="maker_id" name="maker_id" required>
+            <option value="Britannia" selected>Britannia</option>
+        </select><br><br>
 
         <button type="submit">Analyze</button>
     </form>
 
     <div id="result">
         <h2>Plots:</h2>
+        <!-- Section 1: Over Time (all data) -->
         <img id="plot1" alt="Point Spread Plot 1" style="display:none;">
+        <!-- Section 2: Over Time by Hour (24 subplots) -->
         <img id="plot2" alt="Point Spread Plot 2" style="display:none;">
+        <!-- Section 3a: Distribution normal scale -->
+        <img id="plot3" alt="Distribution Plot (normal scale)" style="display:none;">
+        <!-- Section 3b: Distribution log scale -->
+        <img id="plot4" alt="Distribution Plot (log scale)" style="display:none;">
+        <!-- Section 4: Outlier Plot -->
+        <img id="plot5" alt="Outlier Plot" style="display:none;">
         
         <h2>Statistics:</h2>
         <div id="statistics" style="display:none;">
@@ -141,15 +188,38 @@
             try {
                 const response = await axios.post('/get_data', formData);
                 if (response.data.status === 'success') {
-                    // Display Plot 1
-                    const plot1 = document.getElementById('plot1');
-                    plot1.src = response.data.plot1_url;
-                    plot1.style.display = 'block';
+                    // Display Plots
+                    const plotIds = ['plot1', 'plot2', 'plot3', 'plot4', 'plot5'];
+                    plotIds.forEach((pid) => {
+                        document.getElementById(pid).style.display = 'none';
+                    });
 
-                    // Display Plot 2
-                    const plot2 = document.getElementById('plot2');
-                    plot2.src = response.data.plot2_url;
-                    plot2.style.display = 'block';
+                    // If plotX_url is in response, show the plot
+                    if (response.data.plot1_url) {
+                        const plot1 = document.getElementById('plot1');
+                        plot1.src = response.data.plot1_url;
+                        plot1.style.display = 'block';
+                    }
+                    if (response.data.plot2_url) {
+                        const plot2 = document.getElementById('plot2');
+                        plot2.src = response.data.plot2_url;
+                        plot2.style.display = 'block';
+                    }
+                    if (response.data.plot3_url) {
+                        const plot3 = document.getElementById('plot3');
+                        plot3.src = response.data.plot3_url;
+                        plot3.style.display = 'block';
+                    }
+                    if (response.data.plot4_url) {
+                        const plot4 = document.getElementById('plot4');
+                        plot4.src = response.data.plot4_url;
+                        plot4.style.display = 'block';
+                    }
+                    if (response.data.plot5_url) {
+                        const plot5 = document.getElementById('plot5');
+                        plot5.src = response.data.plot5_url;
+                        plot5.style.display = 'block';
+                    }
 
                     // Display Statistics
                     const stats = response.data.statistics;

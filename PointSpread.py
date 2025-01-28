@@ -1,5 +1,4 @@
 import os
-import os.path
 import pymysql
 from sshtunnel import SSHTunnelForwarder
 import pandas as pd
@@ -8,7 +7,7 @@ import numpy as np
 import seaborn as sns
 
 import matplotlib
-matplotlib.use('Agg')  # Use the Anti-Grain Geometry backend for non-GUI plotting
+matplotlib.use('Agg')  # Use a non-GUI backend
 import matplotlib.pyplot as plt
 
 import io
@@ -30,38 +29,34 @@ def get_quote_data(date, symbol):
     # -------------------------------
     # 1. Transform symbol for filename
     # -------------------------------
-    # Example: "XAU/USD" -> "XAUUSE"
     symbol_transformed = symbol.replace('/', '')
 
     # -------------------------------
     # 2. Build the partition name
     # -------------------------------
-    date = pd.Timestamp(date)
+    date_ts = pd.Timestamp(date)
     month_map = {
         1: "jan", 2: "feb", 3: "mar", 4: "apr", 5: "may", 6: "jun",
         7: "jul", 8: "aug", 9: "sep", 10: "oct", 11: "nov", 12: "dec"
     }
-    partition_name = f"p_{month_map[date.month]}_{date.year}"
-    
+    partition_name = f"p_{month_map[date_ts.month]}_{date_ts.year}"
+
     # -------------------------------
     # 3. Build time filter boundaries
     # -------------------------------
-    if not isinstance(date, pd.Timestamp):
-        date = pd.Timestamp(date)
-    start_str = date.strftime("%Y-%m-%d 00:00:00")
-    end_str = (date + pd.Timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
-    
+    start_str = date_ts.strftime("%Y-%m-%d 00:00:00")
+    end_str = (date_ts + pd.Timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
+
     # -------------------------------
     # 4. Clean up symbol for file naming
     # -------------------------------
-    date_str = date.strftime("%Y-%m-%d")
+    date_str = date_ts.strftime("%Y-%m-%d")
     file_name = f"{symbol_transformed}_{date_str}.pkl"
     file_path = os.path.join(data_dir, file_name)
-    
+
     # -------------------------------
     # 5. Check if file exists locally
     # -------------------------------
-    print(file_path)
     if os.path.exists(file_path):
         try:
             print(f"Loading data from local file: {file_path}")
@@ -98,7 +93,7 @@ def get_quote_data(date, symbol):
             AND TimeRecorded >= '{start_str}'
             AND TimeRecorded < '{end_str}';
     """
-    
+
     ssh_host = '18.133.184.11'
     ssh_user = 'ubuntu'
     ssh_key_file = '/Users/jackhan/Desktop/Alpfin/OneZero_Data.pem'
@@ -107,7 +102,7 @@ def get_quote_data(date, symbol):
     db_user = 'Ruize'
     db_password = 'Ma5hedPotato567='
     db_name = 'Alp_CPT_Data'
-    
+
     columns = [
         "MakerId",
         "CoreSymbol",
@@ -125,7 +120,7 @@ def get_quote_data(date, symbol):
         "ForwardPriceDelta",
         "id"
     ]
-    
+
     try:
         with SSHTunnelForwarder(
             (ssh_host, 22),
@@ -155,7 +150,7 @@ def get_quote_data(date, symbol):
                 query_duration = time.time() - query_start_time
                 print(f"Query Execution Time: {query_duration:.2f} seconds.")
                 
-                # Start Data Transfer Timer
+                # Data Transfer Timer
                 transfer_start_time = time.time()
                 rows = cursor.fetchall()
                 transfer_duration = time.time() - transfer_start_time
@@ -184,127 +179,255 @@ def get_quote_data(date, symbol):
         print(f"ERROR for {symbol} on {date_str}: {str(e)}")
         return None
 
-# Example usage
-# requested_date = pd.Timestamp("2025-01-08")
-# df_result = get_quote_data(requested_date, "XAU/USD")
+def PointSpreadDisplay(df_input, trade_vol, date, maker_id="Britannia", top_of_book=False, symbol=""):
+    """
+    Calculates point difference across the quote data, returning
+    multiple plots (as base64) and a statistics dictionary.
+    """
 
-def PointSpreadDisplay(df_input, trade_vol, date, maker_id="Britannia"):
-    df_loaded = df_input[df_input['MakerId'] == maker_id]
-    depth_dfs = {}  # Dictionary to store dataframes for each depth
+    # Filter by MakerId
+    df_loaded = df_input[df_input['MakerId'] == maker_id].copy()
 
+    # Convert TimeRecorded to datetime if not already
+    if not pd.api.types.is_datetime64_any_dtype(df_loaded['TimeRecorded']):
+        df_loaded['TimeRecorded'] = pd.to_datetime(df_loaded['TimeRecorded'])
+
+    # Split by depth & side
+    depth_dfs = {}
     for depth in range(7):  # Depth ranges from 0 to 6
-        depth_dfs[f'sell_df_depth{depth}'] = df_loaded[(df_loaded["Side"] == 0) & (df_loaded["Depth"] == depth)].copy()
-        depth_dfs[f'sell_df_depth{depth}'] = depth_dfs[f'sell_df_depth{depth}'].rename(
+        # Sell side
+        sell_df = df_loaded[(df_loaded["Side"] == 0) & (df_loaded["Depth"] == depth)].copy()
+        sell_df = sell_df.rename(
             columns={
                 "Price": f"Sell_Price_Depth{depth}", 
                 "Size": f"Sell_Size_Depth{depth}"
             }
         )
-        depth_dfs[f'sell_df_depth{depth}'] = depth_dfs[f'sell_df_depth{depth}'][["CoreSymbol", "TimeRecorded", f"Sell_Price_Depth{depth}", f"Sell_Size_Depth{depth}"]]
+        sell_df = sell_df[["CoreSymbol", "TimeRecorded", f"Sell_Price_Depth{depth}", f"Sell_Size_Depth{depth}"]]
+        depth_dfs[f'sell_df_depth{depth}'] = sell_df
 
-        depth_dfs[f'buy_df_depth{depth}'] = df_loaded[(df_loaded["Side"] == 1) & (df_loaded["Depth"] == depth)].copy()
-        depth_dfs[f'buy_df_depth{depth}'] = depth_dfs[f'buy_df_depth{depth}'].rename(
+        # Buy side
+        buy_df = df_loaded[(df_loaded["Side"] == 1) & (df_loaded["Depth"] == depth)].copy()
+        buy_df = buy_df.rename(
             columns={
                 "Price": f"Depth{depth}_Buy_Price", 
                 "Size": f"Depth{depth}_Buy_Size"
             }
         )
-        depth_dfs[f'buy_df_depth{depth}'] = depth_dfs[f'buy_df_depth{depth}'][["CoreSymbol", "TimeRecorded", f"Depth{depth}_Buy_Price", f"Depth{depth}_Buy_Size"]]
+        buy_df = buy_df[["CoreSymbol", "TimeRecorded", f"Depth{depth}_Buy_Price", f"Depth{depth}_Buy_Size"]]
+        depth_dfs[f'buy_df_depth{depth}'] = buy_df
 
-    # Initialize the merged dataframe with the first depth's dataframes
+    # Merge them all
     merged_df = depth_dfs['sell_df_depth0']
-    # Iterate through the remaining depths and merge them
     for depth in range(1, 7):
         merged_df = merged_df.merge(depth_dfs[f'sell_df_depth{depth}'], on=["CoreSymbol", "TimeRecorded"], how="outer")
-
-    for depth in range(0, 7):
+    for depth in range(7):
         merged_df = merged_df.merge(depth_dfs[f'buy_df_depth{depth}'], on=["CoreSymbol", "TimeRecorded"], how="outer")
 
-    def calculate_price_difference_per_row(row, trade_vol):
-        # Initialize variables for buy and sell computations
-        total_buy_vol = 0.0
-        total_sell_vol = 0.0
-        weighted_buy_price = 0.0
-        weighted_sell_price = 0.0
+    # Sort by TimeRecorded so it makes sense in time-series
+    merged_df = merged_df.sort_values(by="TimeRecorded").reset_index(drop=True)
 
-        # Calculate total available volumes for buy and sell
-        max_buy_vol = np.sum([row[f"Depth{depth}_Buy_Size"] for depth in range(7)])
-        max_sell_vol = np.sum([row[f"Sell_Size_Depth{depth}"] for depth in range(7)])
+    # Calculate Point_Diff
+    if top_of_book:
+        # Just Depth0_Buy_Price - Sell_Price_Depth0
+        merged_df["Point_Diff"] = (
+            merged_df["Depth0_Buy_Price"] - merged_df["Sell_Price_Depth0"]
+        )
+    else:
+        # Full fill simulation based on trade_vol
+        def calculate_price_difference_per_row(row, vol):
+            # Initialize variables
+            total_buy_vol = 0.0
+            total_sell_vol = 0.0
+            weighted_buy_price = 0.0
+            weighted_sell_price = 0.0
 
-        # Cap trade volume at the maximum available volume
-        capped_trade_vol = min(trade_vol, max_buy_vol, max_sell_vol)
+            # Max available volumes
+            max_buy_vol = np.nansum([row.get(f"Depth{d}_Buy_Size", 0) for d in range(7)])
+            max_sell_vol = np.nansum([row.get(f"Sell_Size_Depth{d}", 0) for d in range(7)])
 
-        # Simulate buy process
-        remaining_vol = capped_trade_vol
-        for depth in range(7):
-            buy_price = row[f"Depth{depth}_Buy_Price"]
-            buy_size = row[f"Depth{depth}_Buy_Size"]
+            # Actual volume for the trade is limited by what's available
+            capped_vol = min(vol, max_buy_vol, max_sell_vol)
 
-            # Accumulate volume and weighted price
-            if remaining_vol <= 0:
-                break
-            buyable_vol = min(buy_size, remaining_vol)
-            weighted_buy_price += np.multiply(buyable_vol, buy_price)
-            total_buy_vol += buyable_vol
-            remaining_vol -= buyable_vol
+            # Simulate buy
+            remaining_vol = capped_vol
+            for d in range(7):
+                buy_price = row.get(f"Depth{d}_Buy_Price", np.nan)
+                buy_size = row.get(f"Depth{d}_Buy_Size", 0.0)
+                if pd.isna(buy_price):
+                    continue
+                if remaining_vol <= 0:
+                    break
 
-        # Simulate sell process
-        remaining_vol = capped_trade_vol
-        for depth in range(7):
-            sell_price = row[f"Sell_Price_Depth{depth}"]
-            sell_size = row[f"Sell_Size_Depth{depth}"]
+                buyable_vol = min(buy_size, remaining_vol)
+                weighted_buy_price += buyable_vol * buy_price
+                total_buy_vol += buyable_vol
+                remaining_vol -= buyable_vol
 
-            # Accumulate volume and weighted price
-            if remaining_vol <= 0:
-                break
-            sellable_vol = min(sell_size, remaining_vol)
-            weighted_sell_price += np.multiply(sellable_vol, sell_price)
-            total_sell_vol += sellable_vol
-            remaining_vol -= sellable_vol
+            # Simulate sell
+            remaining_vol = capped_vol
+            for d in range(7):
+                sell_price = row.get(f"Sell_Price_Depth{d}", np.nan)
+                sell_size = row.get(f"Sell_Size_Depth{d}", 0.0)
+                if pd.isna(sell_price):
+                    continue
+                if remaining_vol <= 0:
+                    break
 
-        # Calculate average prices with protection against division by zero
-        avg_buy_price = np.divide(weighted_buy_price, total_buy_vol) if total_buy_vol > 0 else np.nan
-        avg_sell_price = np.divide(weighted_sell_price, total_sell_vol) if total_sell_vol > 0 else np.nan
+                sellable_vol = min(sell_size, remaining_vol)
+                weighted_sell_price += sellable_vol * sell_price
+                total_sell_vol += sellable_vol
+                remaining_vol -= sellable_vol
 
-        # Calculate price difference
-        price_difference = avg_buy_price - avg_sell_price if not np.isnan(avg_buy_price) and not np.isnan(avg_sell_price) else np.nan
+            # Averages
+            avg_buy = weighted_buy_price / total_buy_vol if total_buy_vol > 0 else np.nan
+            avg_sell = weighted_sell_price / total_sell_vol if total_sell_vol > 0 else np.nan
 
-        return price_difference
+            # difference
+            return avg_buy - avg_sell if (not np.isnan(avg_buy) and not np.isnan(avg_sell)) else np.nan
 
-    merged_df["Point_Diff"] = merged_df.apply(
-        lambda row: calculate_price_difference_per_row(row, trade_vol), axis=1
-    )
-        
-    # First Plot: Point Difference Over Time
+        merged_df["Point_Diff"] = merged_df.apply(
+            lambda row: calculate_price_difference_per_row(row, trade_vol), axis=1
+        )
+
+    # ---------- PLOTS ----------
+    # Common title substring
+    vol_label = "Top-of-Book" if top_of_book else f"Volume {trade_vol}"
+    common_title = f"{symbol} on {date} ({vol_label})"
+
+    # SECTION 1: Point difference over time (all data)
     plt.figure(figsize=(12, 6))
     plt.plot(
         merged_df["TimeRecorded"], 
         merged_df["Point_Diff"], 
-        marker="o",         # shape of the point (circle)
-        linestyle="none",   # no connecting line
-        markersize=2,       # size of the dots
+        marker="o",
+        linestyle="none",
+        markersize=2,
         alpha=0.5
     )
-    plt.title(f"Point Difference Over Time on {date} at trading volume {trade_vol}", fontsize=16)
+    plt.title(f"Point Difference Over Time - {common_title}", fontsize=16)
     plt.xlabel("TimeRecorded", fontsize=14)
     plt.ylabel("Point Difference", fontsize=14)
     plt.xticks(rotation=45)
     plt.grid(linestyle="--", alpha=0.7)
     plt.tight_layout()
-    
-    # Save the first plot to a buffer
     img1 = io.BytesIO()
     plt.savefig(img1, format='png')
     img1.seek(0)
-    plot1_url = base64.b64encode(img1.getvalue()).decode()
-    
-    # 1. Quick overview (count, mean, std, min, quartiles, max, etc.)
-    describe_default = merged_df['Point_Diff'].describe().to_dict()
+    plot1_url = "data:image/png;base64," + base64.b64encode(img1.getvalue()).decode()
+    plt.close()
 
-    # 2. Custom percentiles (e.g., 5th, 25th, 50th, 75th, 95th)
+    # SECTION 2: 24 subplots, one per hour
+    # Ensure we have an Hour column
+    merged_df["Hour"] = merged_df["TimeRecorded"].dt.hour
+    # Create figure with 24 subplots
+    fig, axes = plt.subplots(nrows=24, ncols=1, figsize=(12, 60), sharex=False, sharey=False)
+    fig.suptitle(f"Point Difference Over Time by Hour - {common_title}", fontsize=16)
+
+    y_min = merged_df["Point_Diff"].min()
+    y_max = merged_df["Point_Diff"].max()
+
+    for hour in range(24):
+        ax = axes[hour]
+        hour_df = merged_df[merged_df["Hour"] == hour]
+        ax.plot(
+            hour_df["TimeRecorded"],
+            hour_df["Point_Diff"],
+            marker="o",
+            linestyle="none",
+            markersize=2,
+            alpha=0.5
+        )
+        # You could set same y-limits across all if desired:
+        # ax.set_ylim([y_min, y_max])
+        ax.set_title(f"Hour {hour:02d}:00", fontsize=12)
+        ax.set_xlabel("TimeRecorded", fontsize=10)
+        ax.set_ylabel("Point Diff", fontsize=10)
+        ax.grid(True, linestyle="--", alpha=0.7)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    img2 = io.BytesIO()
+    plt.savefig(img2, format='png')
+    img2.seek(0)
+    plot2_url = "data:image/png;base64," + base64.b64encode(img2.getvalue()).decode()
+    plt.close()
+
+    # SECTION 3a: Distribution of Point_Diff (normal scale)
+    plt.figure(figsize=(10, 6))
+    plt.hist(merged_df["Point_Diff"].dropna(), bins=50, edgecolor="k", alpha=0.7)
+    plt.title(f"Distribution of Point_Diff - {common_title}", fontsize=16)
+    plt.xlabel("Point_Diff", fontsize=14)
+    plt.ylabel("Frequency", fontsize=14)
+    plt.grid(axis="y", linestyle="--", alpha=0.7)
+    plt.tight_layout()
+    img3 = io.BytesIO()
+    plt.savefig(img3, format='png')
+    img3.seek(0)
+    plot3_url = "data:image/png;base64," + base64.b64encode(img3.getvalue()).decode()
+    plt.close()
+
+    # SECTION 3b: Distribution of Point_Diff (log scale)
+    plt.figure(figsize=(10, 6))
+    plt.hist(merged_df["Point_Diff"].dropna(), bins=50, edgecolor="k", alpha=0.7, log=True)
+    plt.title(f"Distribution of Point_Diff (Log Scale) - {common_title}", fontsize=16)
+    plt.xlabel("Point_Diff", fontsize=14)
+    plt.ylabel("Frequency (log scale)", fontsize=14)
+    plt.grid(axis="y", linestyle="--", alpha=0.7)
+    plt.tight_layout()
+    img4 = io.BytesIO()
+    plt.savefig(img4, format='png')
+    img4.seek(0)
+    plot4_url = "data:image/png;base64," + base64.b64encode(img4.getvalue()).decode()
+    plt.close()
+
+    # SECTION 4: Outlier Plot
+    Q1 = merged_df["Point_Diff"].quantile(0.25)
+    Q3 = merged_df["Point_Diff"].quantile(0.75)
+    IQR = Q3 - Q1
+    lower_bound = Q1 - 1.5 * IQR
+    upper_bound = Q3 + 1.5 * IQR
+    outliers = merged_df[(merged_df["Point_Diff"] < lower_bound) | (merged_df["Point_Diff"] > upper_bound)]
+    num_outliers = len(outliers)
+
+    plt.figure(figsize=(12, 7))
+    # All data
+    sns.histplot(
+        merged_df["Point_Diff"], 
+        bins=50, 
+        color='skyblue', 
+        edgecolor='black', 
+        label='Data', 
+        alpha=0.7
+    )
+    # Outliers
+    if not outliers.empty:
+        sns.histplot(
+            outliers["Point_Diff"], 
+            bins=50, 
+            color='red', 
+            edgecolor='black', 
+            label='Outliers', 
+            alpha=0.7
+        )
+    # Bounds
+    plt.axvline(lower_bound, color='green', linestyle='--', linewidth=2, label=f'Lower Bound ({lower_bound:.2f})')
+    plt.axvline(upper_bound, color='purple', linestyle='--', linewidth=2, label=f'Upper Bound ({upper_bound:.2f})')
+    plt.title(f"Histogram of Point_Diff (Outliers Highlighted) - {common_title}", fontsize=18)
+    plt.xlabel("Point_Diff", fontsize=14)
+    plt.ylabel("Frequency", fontsize=14)
+    plt.legend(fontsize=12)
+    plt.grid(axis="y", linestyle="--", alpha=0.7)
+    plt.tight_layout()
+    img5 = io.BytesIO()
+    plt.savefig(img5, format='png')
+    img5.seek(0)
+    plot5_url = "data:image/png;base64," + base64.b64encode(img5.getvalue()).decode()
+    plt.close()
+
+    # ---------- STATISTICS ----------
+    describe_default = merged_df['Point_Diff'].describe().to_dict()
     describe_custom = merged_df['Point_Diff'].describe(percentiles=[0.05, 0.25, 0.5, 0.75, 0.95]).to_dict()
 
-    # 3. Specific summary statistics
     mean_val = merged_df['Point_Diff'].mean()
     median_val = merged_df['Point_Diff'].median()
     std_val = merged_df['Point_Diff'].std()
@@ -325,20 +448,6 @@ def PointSpreadDisplay(df_input, trade_vol, date, maker_id="Britannia"):
         "Kurtosis": kurt_val
     }
 
-    # 1. Calculate Q1, Q3, and IQR
-    Q1 = merged_df["Point_Diff"].quantile(0.25)
-    Q3 = merged_df["Point_Diff"].quantile(0.75)
-    IQR = Q3 - Q1
-
-    # 2. Define outlier boundaries
-    lower_bound = Q1 - 1.5 * IQR
-    upper_bound = Q3 + 1.5 * IQR
-
-    # 3. Identify outliers
-    outliers = merged_df[(merged_df["Point_Diff"] < lower_bound) | (merged_df["Point_Diff"] > upper_bound)]
-    num_outliers = len(outliers)
-
-    # 4. Compile all statistics
     statistics = {
         "describe_default": describe_default,
         "describe_custom": describe_custom,
@@ -353,59 +462,11 @@ def PointSpreadDisplay(df_input, trade_vol, date, maker_id="Britannia"):
         }
     }
 
-    # Second Plot: Histogram with Outliers
-    plt.figure(figsize=(12, 7))
-
-    # Plot histogram for all data
-    sns.histplot(
-        merged_df["Point_Diff"], 
-        bins=50, 
-        color='skyblue', 
-        edgecolor='black', 
-        label='Data', 
-        alpha=0.7
-    )
-
-    # Overlay histogram for outliers
-    if not outliers.empty:
-        sns.histplot(
-            outliers["Point_Diff"], 
-            bins=50, 
-            color='red', 
-            edgecolor='black', 
-            label='Outliers', 
-            alpha=0.7
-        )
-
-    # Plot vertical lines for bounds
-    plt.axvline(lower_bound, color='green', linestyle='--', linewidth=2, label=f'Lower Bound ({lower_bound:.2f})')
-    plt.axvline(upper_bound, color='purple', linestyle='--', linewidth=2, label=f'Upper Bound ({upper_bound:.2f})')
-
-    # Title and labels
-    plt.title("Histogram of Point_Diff with Outliers Highlighted", fontsize=18)
-    plt.xlabel("Point_Diff", fontsize=14)
-    plt.ylabel("Frequency", fontsize=14)
-
-    # Legend
-    plt.legend(fontsize=12)
-
-    # Grid 
-    plt.grid(axis="y", linestyle="--", alpha=0.7)
-
-    # Tight layout for better spacing
-    plt.tight_layout()
-
-    # Save the second plot to a buffer
-    img2 = io.BytesIO()
-    plt.savefig(img2, format='png')
-    img2.seek(0)
-    plot2_url = base64.b64encode(img2.getvalue()).decode()
-
-    # Close all figures to free memory
-    plt.close('all')
-
     return {
-        "plot1_url": f"data:image/png;base64,{plot1_url}",
-        "plot2_url": f"data:image/png;base64,{plot2_url}",
+        "plot1_url": plot1_url,  # Section 1
+        "plot2_url": plot2_url,  # Section 2
+        "plot3_url": plot3_url,  # Section 3 (normal scale)
+        "plot4_url": plot4_url,  # Section 3 (log scale)
+        "plot5_url": plot5_url,  # Section 4 (outlier)
         "statistics": statistics
     }
