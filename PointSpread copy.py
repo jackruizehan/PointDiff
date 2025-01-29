@@ -1,6 +1,7 @@
 # PointSpread.py
 import os
 import pymysql
+from sshtunnel import SSHTunnelForwarder
 import pandas as pd
 import time
 import numpy as np
@@ -13,7 +14,7 @@ import matplotlib.pyplot as plt
 import io
 import base64
 
-def get_quote_data(date_from, date_to, symbol):
+def get_quote_data(date, symbol):
     """
     Fetch quote data for a specific date (YYYY-MM-DD) and symbol from Alp_Quotes.
     - Checks if data already exists locally; if so, load from file.
@@ -34,19 +35,41 @@ def get_quote_data(date_from, date_to, symbol):
     # -------------------------------
     # 2. Build the partition name
     # -------------------------------
-    from_date_ts = pd.Timestamp(date_from)
-    to_date_ts  = pd.Timestamp(date_to)
-    # month_map = {
-    #     1: "jan", 2: "feb", 3: "mar", 4: "apr", 5: "may", 6: "jun",
-    #     7: "jul", 8: "aug", 9: "sep", 10: "oct", 11: "nov", 12: "dec"
-    # }
-    # partition_name = f"p_{month_map[date_ts.month]}_{date_ts.year}"
+    date_ts = pd.Timestamp(date)
+    month_map = {
+        1: "jan", 2: "feb", 3: "mar", 4: "apr", 5: "may", 6: "jun",
+        7: "jul", 8: "aug", 9: "sep", 10: "oct", 11: "nov", 12: "dec"
+    }
+    partition_name = f"p_{month_map[date_ts.month]}_{date_ts.year}"
 
     # -------------------------------
     # 3. Build time filter boundaries
     # -------------------------------
-    start_str = from_date_ts.strftime("%Y-%m-%d 00:00:00")
-    end_str = to_date_ts.strftime("%Y-%m-%d 00:00:00")
+    start_str = date_ts.strftime("%Y-%m-%d 00:00:00")
+    end_str = (date_ts + pd.Timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
+
+    is_loading_locally = False
+    if is_loading_locally:
+        # -------------------------------
+        # 4. File path naming
+        # -------------------------------
+        file_name = f"{symbol_transformed}_{date}.pkl"
+        file_path = os.path.join(data_dir, file_name)
+
+        # -------------------------------
+        # 5. Check if file exists locally
+        # -------------------------------
+        print(f"Checking for file: {file_path}")
+        if os.path.exists(file_path):
+            try:
+                df = pd.read_pickle(file_path)
+                print(f"Loaded {len(df)} records from file.")
+                return df
+            except Exception:
+                # If reading fails, we fall back to fetch from the DB
+                print('Failed to read from file. Fetching from DB...')
+                pass
+    
 
     # -------------------------------
     # 6. Build the SQL query
@@ -56,11 +79,19 @@ def get_quote_data(date_from, date_to, symbol):
             MakerId, 
             CoreSymbol, 
             TimeRecorded, 
+            TimeSent, 
+            TimeReceived, 
             Depth, 
             Side, 
             Price, 
-            Size,
-        FROM Alp_Quotes
+            Size, 
+            Provider, 
+            IndicativeFlags, 
+            QuoteFlags, 
+            DisabledFlags, 
+            ForwardPriceDelta, 
+            id
+        FROM Alp_Quotes PARTITION ({partition_name})
         FORCE INDEX (idx_time_recorded)
         WHERE 
             CoreSymbol = '{symbol}'
@@ -68,10 +99,10 @@ def get_quote_data(date_from, date_to, symbol):
             AND TimeRecorded < '{end_str}';
     """
 
-    # -------------------------------
-    # 7. Database Connection Parameters
-    # -------------------------------
-    db_host = '127.0.0.1'  # Assuming the DB is localhost
+    ssh_host = '18.133.184.11'
+    ssh_user = 'ubuntu'
+    ssh_key_file = '/Users/jackhan/Desktop/Alpfin/OneZero_Data.pem'
+    db_host = '127.0.0.1'
     db_port = 3306
     db_user = 'Ruize'
     db_password = 'Ma5hedPotato567='
@@ -81,45 +112,60 @@ def get_quote_data(date_from, date_to, symbol):
         "MakerId",
         "CoreSymbol",
         "TimeRecorded",
+        "TimeSent",
+        "TimeReceived",
         "Depth",
         "Side",
         "Price",
         "Size",
+        "Provider",
+        "IndicativeFlags",
+        "QuoteFlags",
+        "DisabledFlags",
+        "ForwardPriceDelta",
+        "id"
     ]
 
     # -------------------------------
-    # 8. Direct MySQL Retrieval (No SSH)
+    # 7. SSH tunnel + MySQL retrieval
     # -------------------------------
     try:
-        connection = pymysql.connect(
-            host=db_host,
-            port=db_port,
-            user=db_user,
-            password=db_password,
-            database=db_name,
-            connect_timeout=10
-        )
+        with SSHTunnelForwarder(
+            (ssh_host, 22),
+            ssh_username=ssh_user,
+            ssh_pkey=ssh_key_file,
+            remote_bind_address=(db_host, db_port),
+            allow_agent=False,
+            host_pkey_directories=[]
+        ) as tunnel:
+            
+            connection = pymysql.connect(
+                host='127.0.0.1',
+                port=tunnel.local_bind_port,
+                user=db_user,
+                password=db_password,
+                database=db_name,
+                connect_timeout=10
+            )
+            
+            try:
+                cursor = connection.cursor()
+                print(f"Executing query for {symbol} on {date}...")
+                cursor.execute(query)
+                print("Query executed.")
+                rows = cursor.fetchall()
+                df = pd.DataFrame(rows, columns=columns)
 
-        try:
-            print("Establishing DB Connection")
-            cursor = connection.cursor()
-            print(f"Executing query for {symbol} on {date}...")
-            cursor.execute(query)
-            print("Query executed.")
-            rows = cursor.fetchall()
-            print("Data Fetched")
-            df = pd.DataFrame(rows, columns=columns)
-
-            # Save locally
-            df.to_pickle(file_path)
-            return df
-
-        finally:
-            cursor.close()
-            connection.close()
-
+                # Save locally
+                df.to_pickle(file_path)
+                return df
+            
+            finally:
+                cursor.close()
+                connection.close()
+                
     except Exception as e:
-        print(f"ERROR fetching data for {symbol} from {from_date} to {to_date}: {str(e)}")
+        print(f"ERROR fetching data for {symbol} on {date}: {str(e)}")
         return None
 
 
@@ -151,7 +197,7 @@ def PointSpreadDisplay(df_input, trade_vol, date_range, maker_id="Britannia", to
         "statistics": {...}
       }
     """
-    df_loaded = df_input[df_input['MakerId'] == maker_id]
+    df_loaded = df_input[df_input['MakerId'] == maker_id].copy()
 
     # Convert TimeRecorded to datetime if not already
     if not pd.api.types.is_datetime64_any_dtype(df_loaded['TimeRecorded']):
@@ -164,7 +210,7 @@ def PointSpreadDisplay(df_input, trade_vol, date_range, maker_id="Britannia", to
     depth_dfs = {}
     for depth in range(7):
         # Sell side: Side=0
-        sell_df = df_loaded[(df_loaded["Side"] == 0) & (df_loaded["Depth"] == depth)]
+        sell_df = df_loaded[(df_loaded["Side"] == 0) & (df_loaded["Depth"] == depth)].copy()
         sell_df = sell_df.rename(
             columns={
                 "Price": f"Sell_Price_Depth{depth}", 
@@ -175,7 +221,7 @@ def PointSpreadDisplay(df_input, trade_vol, date_range, maker_id="Britannia", to
         depth_dfs[f'sell_df_depth{depth}'] = sell_df
 
         # Buy side: Side=1
-        buy_df = df_loaded[(df_loaded["Side"] == 1) & (df_loaded["Depth"] == depth)]
+        buy_df = df_loaded[(df_loaded["Side"] == 1) & (df_loaded["Depth"] == depth)].copy()
         buy_df = buy_df.rename(
             columns={
                 "Price": f"Buy_Price_Depth{depth}", 
@@ -187,7 +233,7 @@ def PointSpreadDisplay(df_input, trade_vol, date_range, maker_id="Britannia", to
 
     merged_df = None
     # Start with Depth0 sell
-    merged_df = depth_dfs['sell_df_depth0']
+    merged_df = depth_dfs['sell_df_depth0'].copy()
 
     # Merge sells depth1..6
     for depth in range(1, 7):

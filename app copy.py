@@ -48,24 +48,22 @@ def get_data():
         if (to_date - from_date).days > 7:
             return jsonify({"status": "error", "message": "Date range cannot exceed 7 days."})
         
-        # # 4. Collect Data for Each Day in the Range
-        # all_data_frames = []
-        # current_date = from_date
-        # while current_date <= to_date:
-        #     date_str = current_date.strftime("%Y-%m-%d")
-        #     # Fetch data for that single day
-        #     df_day = get_quote_data(date_str, symbol)
-        #     if df_day is not None and not df_day.empty:
-        #         all_data_frames.append(df_day)
-        #     current_date += pd.Timedelta(days=1)
+        # 4. Collect Data for Each Day in the Range
+        all_data_frames = []
+        current_date = from_date
+        while current_date <= to_date:
+            date_str = current_date.strftime("%Y-%m-%d")
+            # Fetch data for that single day
+            df_day = get_quote_data(date_str, symbol)
+            if df_day is not None and not df_day.empty:
+                all_data_frames.append(df_day)
+            current_date += pd.Timedelta(days=1)
         
-        # # Combine everything into a single DataFrame
-        # if not all_data_frames:
-        #     return jsonify({"status": "error", "message": "No data found for selected date range."})
+        # Combine everything into a single DataFrame
+        if not all_data_frames:
+            return jsonify({"status": "error", "message": "No data found for selected date range."})
         
-        # df_combined = pd.concat(all_data_frames, ignore_index=True)
-        print("start getting data from db")
-        df_combined = get_quote_data(from_date_str, to_date_str, symbol)
+        df_combined = pd.concat(all_data_frames, ignore_index=True)
         
         # 5. Generate Plots and Statistics
         #    Pass the combined DataFrame but also the date range (for display) if needed
