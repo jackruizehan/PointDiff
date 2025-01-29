@@ -48,25 +48,28 @@ def get_quote_data(date, symbol):
     start_str = date_ts.strftime("%Y-%m-%d 00:00:00")
     end_str = (date_ts + pd.Timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
 
-    # -------------------------------
-    # 4. File path naming
-    # -------------------------------
-    file_name = f"{symbol_transformed}_{date}.pkl"
-    file_path = os.path.join(data_dir, file_name)
+    is_loading_locally = True
+    if is_loading_locally:
+        # -------------------------------
+        # 4. File path naming
+        # -------------------------------
+        file_name = f"{symbol_transformed}_{date}.pkl"
+        file_path = os.path.join(data_dir, file_name)
 
-    # -------------------------------
-    # 5. Check if file exists locally
-    # -------------------------------
-    print(f"Checking for file: {file_path}")
-    if os.path.exists(file_path):
-        try:
-            df = pd.read_pickle(file_path)
-            print(f"Loaded {len(df)} records from file.")
-            return df
-        except Exception:
-            # If reading fails, we fall back to fetch from the DB
-            print('Failed to read from file. Fetching from DB...')
-            pass
+        # -------------------------------
+        # 5. Check if file exists locally
+        # -------------------------------
+        print(f"Checking for file: {file_path}")
+        if os.path.exists(file_path):
+            try:
+                df = pd.read_pickle(file_path)
+                print(f"Loaded {len(df)} records from file.")
+                return df
+            except Exception:
+                # If reading fails, we fall back to fetch from the DB
+                print('Failed to read from file. Fetching from DB...')
+                pass
+    
 
     # -------------------------------
     # 6. Build the SQL query
