@@ -48,7 +48,7 @@ def get_quote_data(date, symbol):
     start_str = date_ts.strftime("%Y-%m-%d 00:00:00")
     end_str = (date_ts + pd.Timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
 
-    is_loading_locally = True
+    is_loading_locally = False
     if is_loading_locally:
         # -------------------------------
         # 4. File path naming
