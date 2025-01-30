@@ -1,0 +1,1122 @@
+This is a project build in python. 
+The idea is that a user enter a date range, trading symbol, and shows the point spread which is the sell - buy quotation price in a number of way, including point spread accross the day, point spread over all distribution, and key statictics.
+Code structure:
+ PointDiff/
+    app.py
+    PointSpread.py
+    templates/
+        index.html
+
+
+app.py:
+# app.py
+from flask import Flask, render_template, request, jsonify
+import pandas as pd
+from PointSpread import get_quote_data, PointSpreadDisplay
+
+app = Flask(__name__)
+
+# Home route
+@app.route('/')
+def index():
+    return render_template('index.html')  # Render the HTML template
+
+# Route to fetch and process data
+@app.route('/get_data', methods=['POST'])
+def get_data():
+    try:
+        # 1. Parse Form Inputs
+        from_date_str = request.form.get('from_date')  # start date string (YYYY-MM-DD)
+        to_date_str = request.form.get('to_date')      # end date string   (YYYY-MM-DD)
+        symbol = request.form.get('symbol')            # from the dropdown
+        maker_id = request.form.get('maker_id')        # from the dropdown
+        
+        # We are using a radio or logic that ensures only one is chosen:
+        #   top_of_book='on' means top-of-book
+        #   Otherwise user might have typed a volume
+        top_of_book_str = request.form.get('top_of_book', 'off')  # 'on' or 'off'
+        top_of_book = (top_of_book_str == 'on')
+        
+        trade_vol_str = request.form.get('trade_vol', '0')
+        trade_vol = int(trade_vol_str) if trade_vol_str else 0
+        
+        # 2. Enforce "volume only for XAU/USD; otherwise top-of-book must be True"
+        if symbol != 'XAU/USD':
+            # Force top_of_book to True if symbol is not XAU/USD
+            top_of_book = True
+            trade_vol = 0
+        
+        # 3. Validate the date range. Make sure from_date <= to_date, and max 7 days
+        if not from_date_str or not to_date_str:
+            return jsonify({"status": "error", "message": "Please select both from_date and to_date."})
+        
+        from_date = pd.to_datetime(from_date_str)
+        to_date = pd.to_datetime(to_date_str)
+        if from_date > to_date:
+            return jsonify({"status": "error", "message": "From date cannot be after To date."})
+        
+        # Check maximum 7-day range
+        if (to_date - from_date).days > 7:
+            return jsonify({"status": "error", "message": "Date range cannot exceed 7 days."})
+        
+        # # 4. Collect Data for Each Day in the Range
+        # all_data_frames = []
+        # current_date = from_date
+        # while current_date <= to_date:
+        #     date_str = current_date.strftime("%Y-%m-%d")
+        #     # Fetch data for that single day
+        #     df_day = get_quote_data(date_str, symbol)
+        #     if df_day is not None and not df_day.empty:
+        #         all_data_frames.append(df_day)
+        #     current_date += pd.Timedelta(days=1)
+        
+        # # Combine everything into a single DataFrame
+        # if not all_data_frames:
+        #     return jsonify({"status": "error", "message": "No data found for selected date range."})
+        
+        # df_combined = pd.concat(all_data_frames, ignore_index=True)
+        print("start getting data from db")
+        df_combined = get_quote_data(from_date_str, to_date_str, symbol)
+        
+        # 5. Generate Plots and Statistics
+        #    Pass the combined DataFrame but also the date range (for display) if needed
+        result = PointSpreadDisplay(
+            df_input=df_combined,
+            trade_vol=trade_vol,
+            date_range=(from_date_str, to_date_str),
+            maker_id=maker_id,
+            top_of_book=top_of_book,
+            symbol=symbol
+        )
+
+        # 6. Return results as JSON
+        return jsonify({
+            "status": "success",
+            "main_time_plot": result.get("main_time_plot"),
+            "distribution_plots": result.get("distribution_plots"),  # normal + log + outliers
+            "hourly_plots": result.get("hourly_plots"),  # nested dict of { date_str: { hour: plot_url } }
+            "statistics": result["statistics"]
+        })
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
+
+if __name__ == '__main__':
+    # Set debug=False in production
+    # app.run(debug=True)
+    app.run(host='0.0.0.0', port=8000, debug=True)
+
+
+PointSpread.py:
+import os
+import pymysql
+import pandas as pd
+import time
+import numpy as np
+import seaborn as sns
+from sshtunnel import SSHTunnelForwarder
+
+import matplotlib
+matplotlib.use('Agg')  # Use a non-GUI backend
+import matplotlib.pyplot as plt
+
+import io
+import base64
+import psutil  # Added for memory monitoring
+
+# Define memory limit in bytes (16 GB)
+MEMORY_LIMIT = 16 * 1024 ** 3  # 16 GB
+
+def check_memory_usage():
+    """
+    Check the current process memory usage.
+    Raises MemoryError if usage exceeds MEMORY_LIMIT.
+    """
+    process = psutil.Process(os.getpid())
+    mem_usage = process.memory_info().rss  # in bytes
+    if mem_usage > MEMORY_LIMIT:
+        raise MemoryError(f"Memory usage exceeded: {mem_usage / (1024 ** 3):.2f} GB")
+
+def get_quote_data(date_from, date_to, symbol, use_ssh=False):
+    """
+    Fetch quote data for a specific date range (YYYY-MM-DD) and symbol from Alp_Quotes or local storage.
+    
+    - If all required local `.pkl` files exist for the date range and symbol, load data from local files.
+    - Otherwise, fetch data from the database, handling multiple partitions if necessary.
+    - Allows connecting directly to the DB or via SSH based on the use_ssh flag.
+    
+    Parameters:
+        date_from (str): Start date in 'YYYY-MM-DD' format.
+        date_to (str): End date in 'YYYY-MM-DD' format.
+        symbol (str): The symbol to fetch data for.
+        use_ssh (bool): Whether to connect via SSH. Default is False.
+    
+    Returns:
+        pd.DataFrame: DataFrame containing the fetched quote data, or None if an error occurs.
+    """
+    try:
+        # -------------------------------
+        # 1. Transform symbol for SQL query and local file
+        # -------------------------------
+        symbol_transformed = symbol.replace('/', '')
+        print(f"Transformed symbol: {symbol_transformed}")
+
+        # -------------------------------
+        # 2. Generate list of all dates in the range
+        # -------------------------------
+        from_date_ts = pd.Timestamp(date_from)
+        to_date_ts = pd.Timestamp(date_to)
+        all_dates = pd.date_range(start=from_date_ts, end=to_date_ts, freq='D')
+        date_strings = all_dates.strftime('%Y-%m-%d').tolist()
+        print(f"Date range: {date_strings}")
+
+        # -------------------------------
+        # 3. Check for local data availability
+        # -------------------------------
+        local_data_available = True
+        local_dataframes = []
+        for date_str in date_strings:
+            check_memory_usage()  # Memory check after each iteration
+            file_path = os.path.join('Data', f"{symbol_transformed}_{date_str}.pkl")
+            if not os.path.exists(file_path):
+                print(f"Local file missing: {file_path}")
+                local_data_available = False
+                break
+            else:
+                print(f"Loading local file: {file_path}")
+                try:
+                    df_local = pd.read_pickle(file_path)
+                    check_memory_usage()  # Memory check after loading each file
+                    # Select relevant columns
+                    df_local = df_local[[
+                        "MakerId",
+                        "CoreSymbol",
+                        "TimeRecorded",
+                        "Depth",
+                        "Side",
+                        "Price",
+                        "Size",
+                    ]]
+                    local_dataframes.append(df_local)
+                except Exception as e:
+                    print(f"Error loading {file_path}: {str(e)}")
+                    local_data_available = False
+                    break
+
+        if local_data_available:
+            print("All local data files found. Loading data from local storage.")
+            if local_dataframes:
+                result_df = pd.concat(local_dataframes, ignore_index=True)
+                check_memory_usage()  # Memory check after concatenation
+                print(f"Loaded {len(result_df)} rows from local files.")
+                return result_df
+            else:
+                print("No data found in local files for the specified range.")
+                return pd.DataFrame(columns=[
+                    "MakerId",
+                    "CoreSymbol",
+                    "TimeRecorded",
+                    "Depth",
+                    "Side",
+                    "Price",
+                    "Size",
+                ])
+        else:
+            print("Local data not fully available. Proceeding to fetch data from the database.")
+
+        # -------------------------------
+        # 4. Determine all relevant partitions
+        # -------------------------------
+        month_map = {
+            1: "jan", 2: "feb", 3: "mar", 4: "apr", 5: "may", 6: "jun",
+            7: "jul", 8: "aug", 9: "sep", 10: "oct", 11: "nov", 12: "dec"
+        }
+
+        # Generate list of months between from_date and to_date inclusive
+        all_partitions = []
+        current = from_date_ts.replace(day=1)
+        end = to_date_ts.replace(day=1)
+        while current <= end:
+            partition_name = f"p_{month_map[current.month]}_{current.year}"
+            all_partitions.append(partition_name)
+            # Move to next month
+            if current.month == 12:
+                current = current.replace(year=current.year + 1, month=1)
+            else:
+                current = current.replace(month=current.month + 1)
+
+        print(f"Identified partitions: {all_partitions}")
+
+        # -------------------------------
+        # 5. Build time filter boundaries
+        # -------------------------------
+        start_str = from_date_ts.strftime("%Y-%m-%d 00:00:00")
+        end_str = to_date_ts.strftime("%Y-%m-%d 00:00:00")
+        print(f"Time filter: {start_str} to {end_str}")
+
+        # -------------------------------
+        # 6. Database Connection Parameters
+        # -------------------------------
+        ssh_host = '18.133.184.11'
+        ssh_user = 'ubuntu'
+        ssh_key_file = '/Users/jackhan/Desktop/Alpfin/OneZero_Data.pem'
+
+        db_host_direct = '127.0.0.1'  # Replace with actual direct DB host
+        db_host_via_ssh = '127.0.0.1'  # DB host when connecting via SSH
+        db_port = 3306
+        db_user = 'Ruize'
+        db_password = 'Ma5hedPotato567='
+        db_name = 'Alp_CPT_Data'
+
+        columns = [
+            "MakerId",
+            "CoreSymbol",
+            "TimeRecorded",
+            "Depth",
+            "Side",
+            "Price",
+            "Size",
+        ]
+
+        # -------------------------------
+        # 7. Build the SQL query for each partition
+        # -------------------------------
+        queries = []
+        for partition in all_partitions:
+            query = f"""
+                SELECT 
+                    MakerId, 
+                    CoreSymbol, 
+                    TimeRecorded, 
+                    Depth, 
+                    Side, 
+                    Price, 
+                    Size
+                FROM Alp_Quotes PARTITION ({partition})
+                FORCE INDEX (idx_time_recorded)
+                WHERE 
+                    CoreSymbol = '{symbol}'
+                    AND TimeRecorded >= '{start_str}'
+                    AND TimeRecorded < '{end_str}';
+            """
+            queries.append(query)
+
+        # -------------------------------
+        # 8. Connect to the database and fetch data
+        # -------------------------------
+        if use_ssh:
+            # SSH connection parameters
+            with SSHTunnelForwarder(
+                (ssh_host, 22),
+                ssh_username=ssh_user,
+                ssh_pkey=ssh_key_file,
+                remote_bind_address=(db_host_via_ssh, db_port),
+                allow_agent=False,
+                host_pkey_directories=[],  # Disable loading keys from ~/.ssh
+            ) as tunnel:
+                local_port = tunnel.local_bind_port
+                print(f"SSH Tunnel established on local port {local_port}")
+                connection = pymysql.connect(
+                    host='127.0.0.1',
+                    port=local_port,
+                    user=db_user,
+                    password=db_password,
+                    database=db_name,
+                    connect_timeout=10
+
+                )
+
+                try:
+                    print("Establishing DB Connection via SSH")
+                    cursor = connection.cursor()
+                    print(f"Executing queries for {symbol} from {date_from} to {date_to}...")
+                    
+                    # Execute each query and collect results
+                    dataframes = []
+                    for q in queries:
+                        check_memory_usage()  # Memory check before executing each query
+                        print(f"Executing query:\n{q}")
+                        cursor.execute(q)
+                        rows = cursor.fetchall()
+                        print(f"Fetched {len(rows)} rows from partition.")
+                        df = pd.DataFrame(rows, columns=columns)
+                        check_memory_usage()  # Memory check after fetching each partition
+                        dataframes.append(df)
+                    
+                    # Concatenate all DataFrames
+                    if dataframes:
+                        result_df = pd.concat(dataframes, ignore_index=True)
+                        check_memory_usage()  # Memory check after concatenation
+                        print(f"All data fetched and concatenated. Total rows: {len(result_df)}")
+                    else:
+                        result_df = pd.DataFrame(columns=columns)
+                        print("No data fetched from database.")
+                    
+                    return result_df
+
+                finally:
+                    cursor.close()
+                    connection.close()
+                    print("Database connection via SSH closed.")
+        else:
+            # Direct DB connection parameters
+            connection = pymysql.connect(
+                host=db_host_direct,
+                port=db_port,
+                user=db_user,
+                password=db_password,
+                database=db_name,
+                connect_timeout=10
+            )
+            try:
+                print("Establishing DB Connection directly")
+                cursor = connection.cursor()
+                print(f"Executing queries for {symbol} from {date_from} to {date_to}...")
+                
+                # Execute each query and collect results
+                dataframes = []
+                for q in queries:
+                    check_memory_usage()  # Memory check before executing each query
+                    print(f"Executing query:\n{q}")
+                    cursor.execute(q)
+                    rows = cursor.fetchall()
+                    print(f"Fetched {len(rows)} rows from partition.")
+                    df = pd.DataFrame(rows, columns=columns)
+                    check_memory_usage()  # Memory check after fetching each partition
+                    dataframes.append(df)
+                
+                # Concatenate all DataFrames
+                if dataframes:
+                    result_df = pd.concat(dataframes, ignore_index=True)
+                    check_memory_usage()  # Memory check after concatenation
+                    print(f"All data fetched and concatenated. Total rows: {len(result_df)}")
+                else:
+                    result_df = pd.DataFrame(columns=columns)
+                    print("No data fetched from database.")
+                
+                return result_df
+
+            finally:
+                cursor.close()
+                connection.close()
+                print("Direct database connection closed.")
+
+    except MemoryError as mem_err:
+        print(f"MemoryError: {str(mem_err)}")
+        raise mem_err  # Re-raise the exception after logging
+    except Exception as e:
+        print(f"ERROR fetching data for {symbol} from {date_from} to {date_to}: {str(e)}")
+        return None
+
+def PointSpreadDisplay(df_input, trade_vol, date_range, maker_id="Britannia", top_of_book=True, symbol="XAU/USD"):
+    """
+    Create:
+      1) Main Point Diff Over Time plot (entire range).
+      2) Distribution plots (normal histogram, log histogram, outliers).
+      3) A dictionary of point-diff-over-time *by date & hour* 
+         so the front-end can display whichever (date, hour) combination is selected.
+
+    Return:
+      {
+        "main_time_plot": <base64>,
+        "distribution_plots": {
+            "hist_normal": <base64>,
+            "hist_log": <base64>,
+            "outlier": <base64>,
+        },
+        "hourly_plots": {
+            "YYYY-MM-DD": {
+                "0": <base64 plot>,
+                "1": <base64 plot>,
+                ...
+            },
+            "YYYY-MM-DD+1": {...},
+            ...
+        },
+        "statistics": {...}
+      }
+    """
+    try:
+        check_memory_usage()  # Memory check at the start
+        df_loaded = df_input[df_input['MakerId'] == maker_id]
+        check_memory_usage()
+
+        # Convert TimeRecorded to datetime if not already
+        if not pd.api.types.is_datetime64_any_dtype(df_loaded['TimeRecorded']):
+            df_loaded['TimeRecorded'] = pd.to_datetime(df_loaded['TimeRecorded'])
+            check_memory_usage()
+
+        # Sort by TimeRecorded
+        df_loaded.sort_values(by="TimeRecorded", inplace=True)
+        check_memory_usage()
+
+        # 1. Merge Sell/Buy by Depth (like before)
+        depth_dfs = {}
+        for depth in range(7):
+            check_memory_usage()
+            # Sell side: Side=0
+            sell_df = df_loaded[(df_loaded["Side"] == 0) & (df_loaded["Depth"] == depth)]
+            sell_df = sell_df.rename(
+                columns={
+                    "Price": f"Sell_Price_Depth{depth}", 
+                    "Size": f"Sell_Size_Depth{depth}"
+                }
+            )
+            sell_df = sell_df[["CoreSymbol", "TimeRecorded", f"Sell_Price_Depth{depth}", f"Sell_Size_Depth{depth}"]]
+            depth_dfs[f'sell_df_depth{depth}'] = sell_df
+
+            # Buy side: Side=1
+            buy_df = df_loaded[(df_loaded["Side"] == 1) & (df_loaded["Depth"] == depth)]
+            buy_df = buy_df.rename(
+                columns={
+                    "Price": f"Buy_Price_Depth{depth}", 
+                    "Size": f"Buy_Size_Depth{depth}"
+                }
+            )
+            buy_df = buy_df[["CoreSymbol", "TimeRecorded", f"Buy_Price_Depth{depth}", f"Buy_Size_Depth{depth}"]]
+            depth_dfs[f'buy_df_depth{depth}'] = buy_df
+
+        check_memory_usage()
+
+        merged_df = None
+        # Start with Depth0 sell
+        merged_df = depth_dfs['sell_df_depth0']
+
+        # Merge sells depth1..6
+        for depth in range(1, 7):
+            check_memory_usage()
+            merged_df = merged_df.merge(depth_dfs[f'sell_df_depth{depth}'], on=["CoreSymbol", "TimeRecorded"], how="outer")
+
+        # Merge buys depth0..6
+        for depth in range(7):
+            check_memory_usage()
+            merged_df = merged_df.merge(depth_dfs[f'buy_df_depth{depth}'], on=["CoreSymbol", "TimeRecorded"], how="outer")
+
+        merged_df.sort_values(by="TimeRecorded", inplace=True)
+        merged_df.reset_index(drop=True, inplace=True)
+        check_memory_usage()
+
+        # 2. Calculate "Point_Diff" depending on top_of_book or volume fill
+        if top_of_book:
+            # Depth0 only: Buy_Price_Depth0 - Sell_Price_Depth0
+            merged_df["Point_Diff"] = (
+                merged_df["Buy_Price_Depth0"] - merged_df["Sell_Price_Depth0"]
+            )
+            check_memory_usage()
+        else:
+            # Full fill simulation
+            def calculate_price_difference_per_row(row, vol):
+                total_buy_vol = 0.0
+                total_sell_vol = 0.0
+                weighted_buy_price = 0.0
+                weighted_sell_price = 0.0
+
+                max_buy_vol = np.nansum([row.get(f"Buy_Size_Depth{d}", 0) for d in range(7)])
+                max_sell_vol = np.nansum([row.get(f"Sell_Size_Depth{d}", 0) for d in range(7)])
+                capped_vol = min(vol, max_buy_vol, max_sell_vol)
+                
+                # buy side
+                remaining = capped_vol
+                for d in range(7):
+                    buy_p = row.get(f"Buy_Price_Depth{d}", np.nan)
+                    buy_s = row.get(f"Buy_Size_Depth{d}", 0.0)
+                    if pd.isna(buy_p):
+                        continue
+                    if remaining <= 0:
+                        break
+                    used_vol = min(buy_s, remaining)
+                    weighted_buy_price += used_vol * buy_p
+                    total_buy_vol += used_vol
+                    remaining -= used_vol
+                
+                # sell side
+                remaining = capped_vol
+                for d in range(7):
+                    sell_p = row.get(f"Sell_Price_Depth{d}", np.nan)
+                    sell_s = row.get(f"Sell_Size_Depth{d}", 0.0)
+                    if pd.isna(sell_p):
+                        continue
+                    if remaining <= 0:
+                        break
+                    used_vol = min(sell_s, remaining)
+                    weighted_sell_price += used_vol * sell_p
+                    total_sell_vol += used_vol
+                    remaining -= used_vol
+                
+                if total_buy_vol > 0 and total_sell_vol > 0:
+                    avg_buy = weighted_buy_price / total_buy_vol
+                    avg_sell = weighted_sell_price / total_sell_vol
+                    return avg_buy - avg_sell
+                else:
+                    return np.nan
+
+            merged_df["Point_Diff"] = merged_df.apply(lambda r: calculate_price_difference_per_row(r, trade_vol), axis=1)
+            check_memory_usage()
+
+        # 3. Build Plots
+        #    We'll label them with the entire date range
+        from_date_str, to_date_str = date_range
+        vol_label = "Top-of-Book" if top_of_book else f"Volume {trade_vol}"
+        common_title = f"{symbol} [{from_date_str} to {to_date_str}] ({vol_label})"
+
+        # --- 3.1 Main Over Time Plot (combined)
+        plt.figure(figsize=(12, 6))
+        plt.plot(
+            merged_df["TimeRecorded"], 
+            merged_df["Point_Diff"], 
+            marker="o",
+            linestyle="none",
+            markersize=2,
+            alpha=0.5
+        )
+        plt.title(f"Point Diff Over Time - {common_title}", fontsize=16)
+        plt.xlabel("Time", fontsize=14)
+        plt.ylabel("Point Diff", fontsize=14)
+        plt.xticks(rotation=45)
+        plt.grid(linestyle="--", alpha=0.7)
+        plt.tight_layout()
+        buf_main = io.BytesIO()
+        plt.savefig(buf_main, format='png')
+        buf_main.seek(0)
+        main_time_plot = "data:image/png;base64," + base64.b64encode(buf_main.getvalue()).decode()
+        plt.close()
+        check_memory_usage()
+
+        # --- 3.2 Distribution Plots (normal, log, and outlier highlight)
+        distribution_plots = {}
+
+        # Normal
+        plt.figure(figsize=(10, 6))
+        plt.hist(merged_df["Point_Diff"].dropna(), bins=50, edgecolor="k", alpha=0.7)
+        plt.title(f"Distribution of Point_Diff - {common_title}", fontsize=16)
+        plt.xlabel("Point_Diff", fontsize=14)
+        plt.ylabel("Frequency", fontsize=14)
+        plt.grid(axis="y", linestyle="--", alpha=0.7)
+        plt.tight_layout()
+        buf_dist = io.BytesIO()
+        plt.savefig(buf_dist, format='png')
+        buf_dist.seek(0)
+        distribution_plots["hist_normal"] = "data:image/png;base64," + base64.b64encode(buf_dist.getvalue()).decode()
+        plt.close()
+        check_memory_usage()
+
+        # Log
+        plt.figure(figsize=(10, 6))
+        plt.hist(merged_df["Point_Diff"].dropna(), bins=50, edgecolor="k", alpha=0.7, log=True)
+        plt.title(f"Distribution of Point_Diff (Log Scale) - {common_title}", fontsize=16)
+        plt.xlabel("Point_Diff", fontsize=14)
+        plt.ylabel("Frequency (log scale)", fontsize=14)
+        plt.grid(axis="y", linestyle="--", alpha=0.7)
+        plt.tight_layout()
+        buf_log = io.BytesIO()
+        plt.savefig(buf_log, format='png')
+        buf_log.seek(0)
+        distribution_plots["hist_log"] = "data:image/png;base64," + base64.b64encode(buf_log.getvalue()).decode()
+        plt.close()
+        check_memory_usage()
+
+        # Outlier
+        Q1 = merged_df["Point_Diff"].quantile(0.25)
+        Q3 = merged_df["Point_Diff"].quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        outliers = merged_df[(merged_df["Point_Diff"] < lower_bound) | (merged_df["Point_Diff"] > upper_bound)]
+
+        plt.figure(figsize=(12, 7))
+        sns.histplot(
+            merged_df["Point_Diff"], 
+            bins=50, 
+            color='skyblue', 
+            edgecolor='black', 
+            label='Data', 
+            alpha=0.7
+        )
+        if not outliers.empty:
+            sns.histplot(
+                outliers["Point_Diff"], 
+                bins=50, 
+                color='red', 
+                edgecolor='black', 
+                label='Outliers', 
+                alpha=0.7
+            )
+        plt.axvline(lower_bound, color='green', linestyle='--', linewidth=2, label=f'Lower Bound ({lower_bound:.2f})')
+        plt.axvline(upper_bound, color='purple', linestyle='--', linewidth=2, label=f'Upper Bound ({upper_bound:.2f})')
+        plt.title(f"Histogram of Point_Diff (Outliers Highlighted) - {common_title}", fontsize=18)
+        plt.xlabel("Point_Diff", fontsize=14)
+        plt.ylabel("Frequency", fontsize=14)
+        plt.legend(fontsize=12)
+        plt.grid(axis="y", linestyle="--", alpha=0.7)
+        plt.tight_layout()
+        buf_outlier = io.BytesIO()
+        plt.savefig(buf_outlier, format='png')
+        buf_outlier.seek(0)
+        distribution_plots["outlier"] = "data:image/png;base64," + base64.b64encode(buf_outlier.getvalue()).decode()
+        plt.close()
+        check_memory_usage()
+
+        # --- 3.3 Create Hourly Plots => { 'YYYY-MM-DD': { '0': base64, '1': base64, ...} }
+        #     We consider each unique date in the data, then each hour for that date
+        merged_df['Date'] = merged_df['TimeRecorded'].dt.date.astype(str)  # 'YYYY-MM-DD'
+        merged_df['Hour'] = merged_df['TimeRecorded'].dt.hour
+
+        hourly_plots = {}
+        unique_dates = merged_df['Date'].unique()
+        for d in unique_dates:
+            check_memory_usage()
+            daily_df = merged_df[merged_df['Date'] == d]
+            hourly_plots[d] = {}
+            for hr in sorted(daily_df['Hour'].unique()):
+                check_memory_usage()
+                hour_df = daily_df[daily_df['Hour'] == hr]
+
+                # Plot
+                plt.figure(figsize=(12, 4))
+                plt.plot(
+                    hour_df["TimeRecorded"], 
+                    hour_df["Point_Diff"],
+                    marker="o",
+                    linestyle="none",
+                    markersize=3,
+                    alpha=0.7
+                )
+                plt.title(f"Point Diff Over Time - {symbol} {d} Hour {hr:02d} ({vol_label})", fontsize=14)
+                plt.xlabel("Time", fontsize=12)
+                plt.ylabel("Point Diff", fontsize=12)
+                plt.xticks(rotation=45)
+                plt.grid(True, linestyle="--", alpha=0.7)
+                plt.tight_layout()
+
+                buf_hr = io.BytesIO()
+                plt.savefig(buf_hr, format='png')
+                buf_hr.seek(0)
+                hr_plot = "data:image/png;base64," + base64.b64encode(buf_hr.getvalue()).decode()
+                plt.close()
+                check_memory_usage()
+
+                hourly_plots[d][str(hr)] = hr_plot
+
+        # --- 4. Statistics
+        desc_default = merged_df['Point_Diff'].describe().to_dict()
+        desc_custom = merged_df['Point_Diff'].describe(percentiles=[0.05, 0.25, 0.5, 0.75, 0.95]).to_dict()
+
+        stats_specific = {
+            "Mean": merged_df['Point_Diff'].mean(),
+            "Median": merged_df['Point_Diff'].median(),
+            "Std": merged_df['Point_Diff'].std(),
+            "Var": merged_df['Point_Diff'].var(),
+            "Min": merged_df['Point_Diff'].min(),
+            "Max": merged_df['Point_Diff'].max(),
+            "Skewness": merged_df['Point_Diff'].skew(),
+            "Kurtosis": merged_df['Point_Diff'].kurt()
+        }
+
+        outlier_info = {
+            "Q1": Q1,
+            "Q3": Q3,
+            "IQR": IQR,
+            "Lower Bound": lower_bound,
+            "Upper Bound": upper_bound,
+            "Number of Outliers": len(outliers)
+        }
+
+        statistics = {
+            "describe_default": desc_default,
+            "describe_custom": desc_custom,
+            "specific_stats": stats_specific,
+            "outlier_info": outlier_info
+        }
+
+        check_memory_usage()
+
+        return {
+            "main_time_plot": main_time_plot,
+            "distribution_plots": distribution_plots,  # dict with hist_normal, hist_log, outlier
+            "hourly_plots": hourly_plots,              # nested dict of { date_str: { hour: plot_url } }
+            "statistics": statistics
+        }
+    
+    except MemoryError as mem_err:
+        print(f"MemoryError: {str(mem_err)}")
+        raise mem_err  # Re-raise the exception after logging
+    except Exception as e:
+        print(f"ERROR in PointSpreadDisplay: {str(e)}")
+        return Nones
+
+
+templates/index.html:
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Forex Point Spread Analysis</title>
+  <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 20px;
+    }
+    form {
+      margin-bottom: 30px;
+    }
+    label {
+      display: inline-block;
+      width: 150px;
+      margin-bottom: 10px;
+    }
+    input, select {
+      padding: 5px;
+      margin-bottom: 10px;
+    }
+    button {
+      padding: 10px 20px;
+      margin-top: 10px;
+    }
+    #result img {
+      max-width: 100%;
+      height: auto;
+      margin-bottom: 20px;
+    }
+    #statistics {
+      background-color: #f9f9f9;
+      padding: 15px;
+      border: 1px solid #ddd;
+    }
+    .stat-section {
+      margin-bottom: 20px;
+    }
+    .stat-section table {
+      border-collapse: collapse;
+      margin: 0 auto;
+      width: 400px;
+    }
+    .stat-section th, .stat-section td {
+      border: 1px solid #ccc;
+      padding: 8px;
+      text-align: left;
+      width: 50%;
+    }
+  </style>
+</head>
+<body>
+  <h1>Forex Point Spread Analysis</h1>
+  <form id="data-form">
+    <!-- Date Range -->
+    <label for="from_date">From Date:</label>
+    <input type="date" id="from_date" name="from_date" required />
+    <br />
+    <label for="to_date">To Date:</label>
+    <input type="date" id="to_date" name="to_date" required />
+    <br /><br />
+
+    <!-- Symbol (dropdown) -->
+    <label for="symbol">Select Symbol:</label>
+    <select id="symbol" name="symbol" required>
+      <option value="AUD/CAD">AUD/CAD</option>
+      <option value="AUD/JPY">AUD/JPY</option>
+      <option value="AUD/USD">AUD/USD</option>
+      <option value="BTCUSD">BTCUSD</option>
+      <option value="CAD/JPY">CAD/JPY</option>
+      <option value="ETHUSD">ETHUSD</option>
+      <option value="EUR/GBP">EUR/GBP</option>
+      <option value="EUR/NZD">EUR/NZD</option>
+      <option value="EUR/SEK">EUR/SEK</option>
+      <option value="EUR/USD">EUR/USD</option>
+      <option value="EUR/ZAR">EUR/ZAR</option>
+      <option value="GBP/JPY">GBP/JPY</option>
+      <option value="GBP/USD">GBP/USD</option>
+      <option value="NASUSD">NASUSD</option>
+      <option value="NZD/USD">NZD/USD</option>
+      <option value="U30USD">U30USD</option>
+      <option value="USD/CAD">USD/CAD</option>
+      <option value="USD/CHF">USD/CHF</option>
+      <option value="USD/JPY">USD/JPY</option>
+      <option value="USOUSD">USOUSD</option>
+      <option value="XAG/USD">XAG/USD</option>
+      <option value="XAU/USD" selected>XAU/USD</option>
+      <option value="XNG/USD">XNG/USD</option>
+    </select>
+    <br /><br />
+
+    <!-- Trading Volume vs. Top-of-Book -->
+    <label>Order Type:</label>
+    <input type="radio" id="radio_volume" name="order_type" value="volume" checked />
+    <label for="radio_volume">Trading Volume</label>
+    <input type="radio" id="radio_top_of_book" name="order_type" value="top_of_book" />
+    <label for="radio_top_of_book">Top-of-Book</label>
+    <br />
+
+    <!-- Volume Input -->
+    <label for="trade_vol">Volume:</label>
+    <input type="number" id="trade_vol" name="trade_vol" value="300" />
+    <br /><br />
+
+    <!-- Market Maker (dropdown) -->
+    <label for="maker_id">Select Market Maker:</label>
+    <select id="maker_id" name="maker_id" required>
+      <option value="Britannia" selected>Britannia</option>
+      <!-- Add other maker_ids if needed -->
+    </select>
+    <br /><br />
+
+    <button type="submit">Analyze</button>
+  </form>
+
+  <div id="result" style="display: none;">
+    <h2>Main Time Plot:</h2>
+    <img id="main_time_plot" alt="Point Diff Over Time" />
+
+    <h2>Distribution / Outlier Plots:</h2>
+    <img id="dist_normal" alt="Distribution - Normal" />
+    <img id="dist_log" alt="Distribution - Log Scale" />
+    <img id="dist_outlier" alt="Outlier Plot" />
+
+    <h2>Hourly Plots</h2>
+    <label for="select_date">Select Date:</label>
+    <select id="select_date"></select>
+    &nbsp;&nbsp;
+    <label for="select_hour">Select Hour:</label>
+    <select id="select_hour"></select>
+    <br /><br />
+    <img id="hourly_plot" alt="Hourly Plot" />
+
+    <h2>Statistics:</h2>
+    <div id="statistics">
+      <div class="stat-section" id="describe-default">
+        <h3>Describe (Default Percentiles)</h3>
+        <table>
+          <thead>
+            <tr><th>Statistic</th><th>Value</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="stat-section" id="describe-custom">
+        <h3>Describe (Custom Percentiles)</h3>
+        <table>
+          <thead>
+            <tr><th>Statistic</th><th>Value</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="stat-section" id="specific-stats">
+        <h3>Specific Statistics</h3>
+        <table>
+          <thead>
+            <tr><th>Statistic</th><th>Value</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="stat-section" id="outlier-info">
+        <h3>Outlier Information</h3>
+        <table>
+          <thead>
+            <tr><th>Statistic</th><th>Value</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Enforce that volume is only valid if symbol==XAU/USD and user chooses "volume" radio.
+    // Otherwise, set top-of-book.
+    const symbolSelect = document.getElementById('symbol');
+    const tradeVolInput = document.getElementById('trade_vol');
+    const radioVolume = document.getElementById('radio_volume');
+    const radioTOB = document.getElementById('radio_top_of_book');
+
+    function enforceVolumeOrTOB() {
+      const sym = symbolSelect.value;
+      if (sym === 'XAU/USD') {
+        // Enable both radio buttons, let user pick.
+        radioVolume.disabled = false;
+        radioTOB.disabled = false;
+        // If user chooses volume, enable tradeVolInput, else disable it
+        if (radioVolume.checked) {
+          tradeVolInput.disabled = false;
+        } else {
+          tradeVolInput.disabled = true;
+        }
+      } else {
+        // Only top-of-book is allowed, so force top-of-book
+        radioVolume.checked = false;
+        radioTOB.checked = true;
+        radioVolume.disabled = true;
+        radioTOB.disabled = true;
+        tradeVolInput.disabled = true;
+      }
+    }
+
+    // On symbol change, enforce the rule
+    symbolSelect.addEventListener('change', enforceVolumeOrTOB);
+
+    // On radio button change, toggle volume input
+    [radioVolume, radioTOB].forEach(r => {
+      r.addEventListener('change', () => {
+        if (radioVolume.checked) {
+          tradeVolInput.disabled = false;
+        } else {
+          tradeVolInput.disabled = true;
+        }
+      });
+    });
+
+    // Initialize
+    enforceVolumeOrTOB();
+
+    // Form Submit
+    document.getElementById('data-form').addEventListener('submit', async function(e) {
+      e.preventDefault();
+
+      const formData = new FormData(e.target);
+      // We only have radio buttons for order_type, but our server expects:
+      //   top_of_book = 'on' or 'off'
+      //   trade_vol
+      // Let's set them properly:
+      if (radioTOB.checked) {
+        formData.set('top_of_book', 'on');
+      } else {
+        formData.set('top_of_book', 'off');
+      }
+
+      // Done, now do the POST
+      try {
+        const response = await axios.post('/get_data', formData);
+        const data = response.data;
+        if (data.status === 'success') {
+          document.getElementById('result').style.display = 'block';
+
+          // 1. Main Time Plot
+          document.getElementById('main_time_plot').src = data.main_time_plot;
+
+          // 2. Distribution / Outlier
+          document.getElementById('dist_normal').src = data.distribution_plots.hist_normal;
+          document.getElementById('dist_log').src = data.distribution_plots.hist_log;
+          document.getElementById('dist_outlier').src = data.distribution_plots.outlier;
+
+          // 3. Hourly Plots => populate date/hour dropdown
+          const hourlyPlots = data.hourly_plots;  // { date: { hour: plot } }
+          const dateSelect = document.getElementById('select_date');
+          const hourSelect = document.getElementById('select_hour');
+          const hourlyPlotImg = document.getElementById('hourly_plot');
+
+          // Clear out existing options
+          dateSelect.innerHTML = '';
+          hourSelect.innerHTML = '';
+          hourlyPlotImg.src = '';
+
+          // Build date options
+          const allDates = Object.keys(hourlyPlots).sort();
+          allDates.forEach(d => {
+            const opt = document.createElement('option');
+            opt.value = d;
+            opt.textContent = d;
+            dateSelect.appendChild(opt);
+          });
+
+          // On date change, repopulate hours
+          dateSelect.addEventListener('change', () => {
+            const selectedDate = dateSelect.value;
+            const hoursObj = hourlyPlots[selectedDate];
+            hourSelect.innerHTML = '';
+            Object.keys(hoursObj).sort((a,b) => parseInt(a)-parseInt(b)).forEach(hr => {
+              const optHr = document.createElement('option');
+              optHr.value = hr;
+              optHr.textContent = hr;
+              hourSelect.appendChild(optHr);
+            });
+            // Clear image
+            hourlyPlotImg.src = '';
+          });
+
+          // On hour change, update image
+          hourSelect.addEventListener('change', () => {
+            const selectedDate = dateSelect.value;
+            const selectedHour = hourSelect.value;
+            if (selectedDate && selectedHour) {
+              hourlyPlotImg.src = hourlyPlots[selectedDate][selectedHour];
+            }
+          });
+
+          // Trigger default date to populate hours
+          if (allDates.length > 0) {
+            dateSelect.value = allDates[0];
+            dateSelect.dispatchEvent(new Event('change'));
+            // Then set hour select to first hour
+            const firstHours = Object.keys(hourlyPlots[allDates[0]]).sort((a,b)=>parseInt(a)-parseInt(b));
+            if (firstHours.length > 0) {
+              hourSelect.value = firstHours[0];
+              hourSelect.dispatchEvent(new Event('change'));
+            }
+          }
+
+          // 4. Statistics
+          const stats = data.statistics;
+          // Describe default
+          const describeDefaultBody = document.querySelector('#describe-default tbody');
+          describeDefaultBody.innerHTML = '';
+          Object.entries(stats.describe_default).forEach(([k,v]) => {
+            const row = document.createElement('tr');
+            row.innerHTML = `<td>${k}</td><td>${v}</td>`;
+            describeDefaultBody.appendChild(row);
+          });
+          // Describe custom
+          const describeCustomBody = document.querySelector('#describe-custom tbody');
+          describeCustomBody.innerHTML = '';
+          Object.entries(stats.describe_custom).forEach(([k,v]) => {
+            const row = document.createElement('tr');
+            row.innerHTML = `<td>${k}</td><td>${v}</td>`;
+            describeCustomBody.appendChild(row);
+          });
+          // Specific stats
+          const specificStatsBody = document.querySelector('#specific-stats tbody');
+          specificStatsBody.innerHTML = '';
+          Object.entries(stats.specific_stats).forEach(([k,v]) => {
+            const row = document.createElement('tr');
+            row.innerHTML = `<td>${k}</td><td>${v}</td>`;
+            specificStatsBody.appendChild(row);
+          });
+          // Outlier info
+          const outlierInfoBody = document.querySelector('#outlier-info tbody');
+          outlierInfoBody.innerHTML = '';
+          Object.entries(stats.outlier_info).forEach(([k,v]) => {
+            const row = document.createElement('tr');
+            row.innerHTML = `<td>${k}</td><td>${v}</td>`;
+            outlierInfoBody.appendChild(row);
+          });
+        } else {
+          alert(data.message || 'Error occurred');
+        }
+      } catch(err) {
+        console.error(err);
+        alert('An error occurred: ' + err);
+      }
+    });
+  </script>
+</body>
+</html>
+
+
+Task:
+1. When running
+    python3 app.py
+   It still uses too much RAM, more than the limit of 12gb.
+   What should I do?
+
+2. Adding a instruction section on the webpage with the following content, help me phrase it nicely:
+    1. Only XAU/USD has Volume option， other symbol only can do Top-of-Book
+    2. The process takes about 5min to run, so wait patiently. If a warning pops up, that means the the query is unsuccessful.
+    3. The maximum date range is 7 days, but longer the period, larger RAM usage, which may result hitting the RAM usage wall and cause failure. This is especialy for XAU/USD
+    4. Contact me at ruize.han@loethberg.com if error persist。
+
+3. I want to depoly it on my local machine so that people can access it from public internet anywhere in the world, I am using a MAC.
+
+4. I want to deploy on AWS so that user can access it from IP:8000 anywhere in the world. How?
+
+Please give me modified code, and instructions
+
