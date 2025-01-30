@@ -1,3 +1,4 @@
+# PointSpread.py
 import os
 import pymysql
 import pandas as pd
@@ -14,8 +15,10 @@ import io
 import base64
 import psutil  # Added for memory monitoring
 
-# Define memory limit in bytes (16 GB)
-MEMORY_LIMIT = 16 * 1024 ** 3  # 16 GB
+# ------------------------------------------------
+# 1) Lower memory limit to 12GB (example)
+# ------------------------------------------------
+MEMORY_LIMIT = 12 * 1024 ** 3  # 12 GB
 
 def check_memory_usage():
     """
@@ -29,20 +32,8 @@ def check_memory_usage():
 
 def get_quote_data(date_from, date_to, symbol, use_ssh=False):
     """
-    Fetch quote data for a specific date range (YYYY-MM-DD) and symbol from Alp_Quotes or local storage.
-    
-    - If all required local `.pkl` files exist for the date range and symbol, load data from local files.
-    - Otherwise, fetch data from the database, handling multiple partitions if necessary.
-    - Allows connecting directly to the DB or via SSH based on the use_ssh flag.
-    
-    Parameters:
-        date_from (str): Start date in 'YYYY-MM-DD' format.
-        date_to (str): End date in 'YYYY-MM-DD' format.
-        symbol (str): The symbol to fetch data for.
-        use_ssh (bool): Whether to connect via SSH. Default is False.
-    
-    Returns:
-        pd.DataFrame: DataFrame containing the fetched quote data, or None if an error occurs.
+    Fetch quote data for a specific date range and symbol from Alp_Quotes or local storage.
+    If local .pkl files exist, load from them. Otherwise, fetch from DB (optionally via SSH).
     """
     try:
         # -------------------------------
@@ -52,7 +43,7 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=False):
         print(f"Transformed symbol: {symbol_transformed}")
 
         # -------------------------------
-        # 2. Generate list of all dates in the range
+        # 2. Generate list of dates
         # -------------------------------
         from_date_ts = pd.Timestamp(date_from)
         to_date_ts = pd.Timestamp(date_to)
@@ -66,7 +57,7 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=False):
         local_data_available = True
         local_dataframes = []
         for date_str in date_strings:
-            check_memory_usage()  # Memory check after each iteration
+            check_memory_usage()  # Memory check
             file_path = os.path.join('Data', f"{symbol_transformed}_{date_str}.pkl")
             if not os.path.exists(file_path):
                 print(f"Local file missing: {file_path}")
@@ -76,7 +67,7 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=False):
                 print(f"Loading local file: {file_path}")
                 try:
                     df_local = pd.read_pickle(file_path)
-                    check_memory_usage()  # Memory check after loading each file
+                    check_memory_usage()  # Memory check
                     # Select relevant columns
                     df_local = df_local[[
                         "MakerId",
@@ -97,7 +88,7 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=False):
             print("All local data files found. Loading data from local storage.")
             if local_dataframes:
                 result_df = pd.concat(local_dataframes, ignore_index=True)
-                check_memory_usage()  # Memory check after concatenation
+                check_memory_usage()  # Memory check
                 print(f"Loaded {len(result_df)} rows from local files.")
                 return result_df
             else:
@@ -115,14 +106,13 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=False):
             print("Local data not fully available. Proceeding to fetch data from the database.")
 
         # -------------------------------
-        # 4. Determine all relevant partitions
+        # 4. Determine relevant partitions
         # -------------------------------
         month_map = {
             1: "jan", 2: "feb", 3: "mar", 4: "apr", 5: "may", 6: "jun",
             7: "jul", 8: "aug", 9: "sep", 10: "oct", 11: "nov", 12: "dec"
         }
 
-        # Generate list of months between from_date and to_date inclusive
         all_partitions = []
         current = from_date_ts.replace(day=1)
         end = to_date_ts.replace(day=1)
@@ -145,14 +135,14 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=False):
         print(f"Time filter: {start_str} to {end_str}")
 
         # -------------------------------
-        # 6. Database Connection Parameters
+        # 6. DB Connection Info
         # -------------------------------
         ssh_host = '18.133.184.11'
         ssh_user = 'ubuntu'
         ssh_key_file = '/Users/jackhan/Desktop/Alpfin/OneZero_Data.pem'
 
-        db_host_direct = '127.0.0.1'  # Replace with actual direct DB host
-        db_host_via_ssh = '127.0.0.1'  # DB host when connecting via SSH
+        db_host_direct = '127.0.0.1'  # Replace with your actual DB host
+        db_host_via_ssh = '127.0.0.1'
         db_port = 3306
         db_user = 'Ruize'
         db_password = 'Ma5hedPotato567='
@@ -192,17 +182,17 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=False):
             queries.append(query)
 
         # -------------------------------
-        # 8. Connect to the database and fetch data
+        # 8. Connect to DB & fetch
         # -------------------------------
         if use_ssh:
-            # SSH connection parameters
+            # SSH approach
             with SSHTunnelForwarder(
                 (ssh_host, 22),
                 ssh_username=ssh_user,
                 ssh_pkey=ssh_key_file,
                 remote_bind_address=(db_host_via_ssh, db_port),
                 allow_agent=False,
-                host_pkey_directories=[],  # Disable loading keys from ~/.ssh
+                host_pkey_directories=[],
             ) as tunnel:
                 local_port = tunnel.local_bind_port
                 print(f"SSH Tunnel established on local port {local_port}")
@@ -213,43 +203,45 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=False):
                     password=db_password,
                     database=db_name,
                     connect_timeout=10
-
                 )
-
                 try:
                     print("Establishing DB Connection via SSH")
                     cursor = connection.cursor()
                     print(f"Executing queries for {symbol} from {date_from} to {date_to}...")
-                    
-                    # Execute each query and collect results
                     dataframes = []
                     for q in queries:
-                        check_memory_usage()  # Memory check before executing each query
+                        check_memory_usage()
                         print(f"Executing query:\n{q}")
                         cursor.execute(q)
                         rows = cursor.fetchall()
                         print(f"Fetched {len(rows)} rows from partition.")
                         df = pd.DataFrame(rows, columns=columns)
-                        check_memory_usage()  # Memory check after fetching each partition
+                        check_memory_usage()
                         dataframes.append(df)
                     
-                    # Concatenate all DataFrames
                     if dataframes:
                         result_df = pd.concat(dataframes, ignore_index=True)
-                        check_memory_usage()  # Memory check after concatenation
-                        print(f"All data fetched and concatenated. Total rows: {len(result_df)}")
+                        check_memory_usage()
+
+                        # --------------------------------
+                        #  Add row sampling if large
+                        # --------------------------------
+                        MAX_ROWS = 1_000_000
+                        if len(result_df) > MAX_ROWS:
+                            result_df = result_df.sample(n=MAX_ROWS, random_state=42)
+                            print(f"DataFrame was sampled to {MAX_ROWS} rows to reduce memory usage.")
+
+                        print(f"All data fetched. Total rows after sampling: {len(result_df)}")
                     else:
                         result_df = pd.DataFrame(columns=columns)
                         print("No data fetched from database.")
-                    
                     return result_df
-
                 finally:
                     cursor.close()
                     connection.close()
                     print("Database connection via SSH closed.")
         else:
-            # Direct DB connection parameters
+            # Direct connection
             connection = pymysql.connect(
                 host=db_host_direct,
                 port=db_port,
@@ -262,30 +254,35 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=False):
                 print("Establishing DB Connection directly")
                 cursor = connection.cursor()
                 print(f"Executing queries for {symbol} from {date_from} to {date_to}...")
-                
-                # Execute each query and collect results
                 dataframes = []
                 for q in queries:
-                    check_memory_usage()  # Memory check before executing each query
+                    check_memory_usage()
                     print(f"Executing query:\n{q}")
                     cursor.execute(q)
                     rows = cursor.fetchall()
                     print(f"Fetched {len(rows)} rows from partition.")
                     df = pd.DataFrame(rows, columns=columns)
-                    check_memory_usage()  # Memory check after fetching each partition
+                    check_memory_usage()
                     dataframes.append(df)
                 
-                # Concatenate all DataFrames
                 if dataframes:
                     result_df = pd.concat(dataframes, ignore_index=True)
-                    check_memory_usage()  # Memory check after concatenation
-                    print(f"All data fetched and concatenated. Total rows: {len(result_df)}")
+                    check_memory_usage()
+
+                    # --------------------------------
+                    #  Add row sampling if large
+                    # --------------------------------
+                    MAX_ROWS = 1_000_000
+                    if len(result_df) > MAX_ROWS:
+                        result_df = result_df.sample(n=MAX_ROWS, random_state=42)
+                        print(f"DataFrame was sampled to {MAX_ROWS} rows to reduce memory usage.")
+
+                    print(f"All data fetched. Total rows after sampling: {len(result_df)}")
                 else:
                     result_df = pd.DataFrame(columns=columns)
                     print("No data fetched from database.")
                 
                 return result_df
-
             finally:
                 cursor.close()
                 connection.close()
@@ -293,58 +290,34 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=False):
 
     except MemoryError as mem_err:
         print(f"MemoryError: {str(mem_err)}")
-        raise mem_err  # Re-raise the exception after logging
+        raise mem_err  # re-raise
     except Exception as e:
         print(f"ERROR fetching data for {symbol} from {date_from} to {date_to}: {str(e)}")
         return None
 
 def PointSpreadDisplay(df_input, trade_vol, date_range, maker_id="Britannia", top_of_book=True, symbol="XAU/USD"):
     """
-    Create:
-      1) Main Point Diff Over Time plot (entire range).
-      2) Distribution plots (normal histogram, log histogram, outliers).
-      3) A dictionary of point-diff-over-time *by date & hour* 
-         so the front-end can display whichever (date, hour) combination is selected.
-
-    Return:
-      {
-        "main_time_plot": <base64>,
-        "distribution_plots": {
-            "hist_normal": <base64>,
-            "hist_log": <base64>,
-            "outlier": <base64>,
-        },
-        "hourly_plots": {
-            "YYYY-MM-DD": {
-                "0": <base64 plot>,
-                "1": <base64 plot>,
-                ...
-            },
-            "YYYY-MM-DD+1": {...},
-            ...
-        },
-        "statistics": {...}
-      }
+    Build plots and statistics for the point spread. Returns a dict with:
+      "main_time_plot", "distribution_plots", "hourly_plots", "statistics".
     """
     try:
-        check_memory_usage()  # Memory check at the start
+        check_memory_usage()
         df_loaded = df_input[df_input['MakerId'] == maker_id]
         check_memory_usage()
 
-        # Convert TimeRecorded to datetime if not already
+        # Convert TimeRecorded to datetime
         if not pd.api.types.is_datetime64_any_dtype(df_loaded['TimeRecorded']):
             df_loaded['TimeRecorded'] = pd.to_datetime(df_loaded['TimeRecorded'])
             check_memory_usage()
 
-        # Sort by TimeRecorded
         df_loaded.sort_values(by="TimeRecorded", inplace=True)
         check_memory_usage()
 
-        # 1. Merge Sell/Buy by Depth (like before)
+        # Merge Depth 0..6 (sell & buy) side by side
         depth_dfs = {}
         for depth in range(7):
             check_memory_usage()
-            # Sell side: Side=0
+            # Sell side => Side=0
             sell_df = df_loaded[(df_loaded["Side"] == 0) & (df_loaded["Depth"] == depth)]
             sell_df = sell_df.rename(
                 columns={
@@ -353,9 +326,10 @@ def PointSpreadDisplay(df_input, trade_vol, date_range, maker_id="Britannia", to
                 }
             )
             sell_df = sell_df[["CoreSymbol", "TimeRecorded", f"Sell_Price_Depth{depth}", f"Sell_Size_Depth{depth}"]]
+
             depth_dfs[f'sell_df_depth{depth}'] = sell_df
 
-            # Buy side: Side=1
+            # Buy side => Side=1
             buy_df = df_loaded[(df_loaded["Side"] == 1) & (df_loaded["Depth"] == depth)]
             buy_df = buy_df.rename(
                 columns={
@@ -366,18 +340,11 @@ def PointSpreadDisplay(df_input, trade_vol, date_range, maker_id="Britannia", to
             buy_df = buy_df[["CoreSymbol", "TimeRecorded", f"Buy_Price_Depth{depth}", f"Buy_Size_Depth{depth}"]]
             depth_dfs[f'buy_df_depth{depth}'] = buy_df
 
-        check_memory_usage()
-
-        merged_df = None
-        # Start with Depth0 sell
         merged_df = depth_dfs['sell_df_depth0']
-
-        # Merge sells depth1..6
         for depth in range(1, 7):
             check_memory_usage()
             merged_df = merged_df.merge(depth_dfs[f'sell_df_depth{depth}'], on=["CoreSymbol", "TimeRecorded"], how="outer")
 
-        # Merge buys depth0..6
         for depth in range(7):
             check_memory_usage()
             merged_df = merged_df.merge(depth_dfs[f'buy_df_depth{depth}'], on=["CoreSymbol", "TimeRecorded"], how="outer")
@@ -386,15 +353,12 @@ def PointSpreadDisplay(df_input, trade_vol, date_range, maker_id="Britannia", to
         merged_df.reset_index(drop=True, inplace=True)
         check_memory_usage()
 
-        # 2. Calculate "Point_Diff" depending on top_of_book or volume fill
+        # Calculate "Point_Diff"
         if top_of_book:
-            # Depth0 only: Buy_Price_Depth0 - Sell_Price_Depth0
-            merged_df["Point_Diff"] = (
-                merged_df["Buy_Price_Depth0"] - merged_df["Sell_Price_Depth0"]
-            )
-            check_memory_usage()
+            # Depth0 only
+            merged_df["Point_Diff"] = merged_df["Buy_Price_Depth0"] - merged_df["Sell_Price_Depth0"]
         else:
-            # Full fill simulation
+            # Volume fill simulation
             def calculate_price_difference_per_row(row, vol):
                 total_buy_vol = 0.0
                 total_sell_vol = 0.0
@@ -441,15 +405,15 @@ def PointSpreadDisplay(df_input, trade_vol, date_range, maker_id="Britannia", to
                     return np.nan
 
             merged_df["Point_Diff"] = merged_df.apply(lambda r: calculate_price_difference_per_row(r, trade_vol), axis=1)
-            check_memory_usage()
+        
+        check_memory_usage()
 
-        # 3. Build Plots
-        #    We'll label them with the entire date range
+        # Build Plots
         from_date_str, to_date_str = date_range
         vol_label = "Top-of-Book" if top_of_book else f"Volume {trade_vol}"
         common_title = f"{symbol} [{from_date_str} to {to_date_str}] ({vol_label})"
 
-        # --- 3.1 Main Over Time Plot (combined)
+        # 3.1 Main Over Time Plot
         plt.figure(figsize=(12, 6))
         plt.plot(
             merged_df["TimeRecorded"], 
@@ -472,7 +436,7 @@ def PointSpreadDisplay(df_input, trade_vol, date_range, maker_id="Britannia", to
         plt.close()
         check_memory_usage()
 
-        # --- 3.2 Distribution Plots (normal, log, and outlier highlight)
+        # 3.2 Distribution Plots
         distribution_plots = {}
 
         # Normal
@@ -531,8 +495,10 @@ def PointSpreadDisplay(df_input, trade_vol, date_range, maker_id="Britannia", to
                 label='Outliers', 
                 alpha=0.7
             )
-        plt.axvline(lower_bound, color='green', linestyle='--', linewidth=2, label=f'Lower Bound ({lower_bound:.2f})')
-        plt.axvline(upper_bound, color='purple', linestyle='--', linewidth=2, label=f'Upper Bound ({upper_bound:.2f})')
+        plt.axvline(lower_bound, color='green', linestyle='--', linewidth=2, 
+                    label=f'Lower Bound ({lower_bound:.2f})')
+        plt.axvline(upper_bound, color='purple', linestyle='--', linewidth=2, 
+                    label=f'Upper Bound ({upper_bound:.2f})')
         plt.title(f"Histogram of Point_Diff (Outliers Highlighted) - {common_title}", fontsize=18)
         plt.xlabel("Point_Diff", fontsize=14)
         plt.ylabel("Frequency", fontsize=14)
@@ -546,9 +512,8 @@ def PointSpreadDisplay(df_input, trade_vol, date_range, maker_id="Britannia", to
         plt.close()
         check_memory_usage()
 
-        # --- 3.3 Create Hourly Plots => { 'YYYY-MM-DD': { '0': base64, '1': base64, ...} }
-        #     We consider each unique date in the data, then each hour for that date
-        merged_df['Date'] = merged_df['TimeRecorded'].dt.date.astype(str)  # 'YYYY-MM-DD'
+        # 3.3 Hourly Plots
+        merged_df['Date'] = merged_df['TimeRecorded'].dt.date.astype(str)
         merged_df['Hour'] = merged_df['TimeRecorded'].dt.hour
 
         hourly_plots = {}
@@ -561,7 +526,6 @@ def PointSpreadDisplay(df_input, trade_vol, date_range, maker_id="Britannia", to
                 check_memory_usage()
                 hour_df = daily_df[daily_df['Hour'] == hr]
 
-                # Plot
                 plt.figure(figsize=(12, 4))
                 plt.plot(
                     hour_df["TimeRecorded"], 
@@ -571,7 +535,7 @@ def PointSpreadDisplay(df_input, trade_vol, date_range, maker_id="Britannia", to
                     markersize=3,
                     alpha=0.7
                 )
-                plt.title(f"Point Diff Over Time - {symbol} {d} Hour {hr:02d} ({vol_label})", fontsize=14)
+                plt.title(f"Point Diff - {symbol} {d} Hour {hr:02d} ({vol_label})", fontsize=14)
                 plt.xlabel("Time", fontsize=12)
                 plt.ylabel("Point Diff", fontsize=12)
                 plt.xticks(rotation=45)
@@ -587,7 +551,7 @@ def PointSpreadDisplay(df_input, trade_vol, date_range, maker_id="Britannia", to
 
                 hourly_plots[d][str(hr)] = hr_plot
 
-        # --- 4. Statistics
+        # 4. Statistics
         desc_default = merged_df['Point_Diff'].describe().to_dict()
         desc_custom = merged_df['Point_Diff'].describe(percentiles=[0.05, 0.25, 0.5, 0.75, 0.95]).to_dict()
 
@@ -622,14 +586,14 @@ def PointSpreadDisplay(df_input, trade_vol, date_range, maker_id="Britannia", to
 
         return {
             "main_time_plot": main_time_plot,
-            "distribution_plots": distribution_plots,  # dict with hist_normal, hist_log, outlier
-            "hourly_plots": hourly_plots,              # nested dict of { date_str: { hour: plot_url } }
+            "distribution_plots": distribution_plots,
+            "hourly_plots": hourly_plots,
             "statistics": statistics
         }
     
     except MemoryError as mem_err:
         print(f"MemoryError: {str(mem_err)}")
-        raise mem_err  # Re-raise the exception after logging
+        raise mem_err
     except Exception as e:
         print(f"ERROR in PointSpreadDisplay: {str(e)}")
-        return None
+        return None  # Fix: was 'Nones' before

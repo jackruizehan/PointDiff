@@ -49,10 +49,38 @@
       text-align: left;
       width: 50%;
     }
+    /* Extra styling for instructions */
+    #instructions {
+      background-color: #eef;
+      border: 1px solid #ccc;
+      padding: 15px;
+      margin-bottom: 30px;
+    }
+    #instructions h2 {
+      margin-top: 0;
+    }
+    #instructions ul {
+      list-style: disc;
+      padding-left: 40px;
+    }
   </style>
 </head>
 <body>
   <h1>Forex Point Spread Analysis</h1>
+
+  <!-- ============================================== -->
+  <!-- New Instruction Section -->
+  <!-- ============================================== -->
+  <div id="instructions">
+    <h2>Usage Instructions</h2>
+    <ul>
+      <li><strong>Symbol & Volume:</strong> Only <em>XAU/USD</em> supports a user-defined Volume. Other symbols only allow Top-of-Book.</li>
+      <li><strong>Processing Time:</strong> The process can take ~5 minutes, so please be patient. If you see a warning, the query likely failed.</li>
+      <li><strong>Max Date Range:</strong> 7 days max. Larger date ranges use more RAM and may fail (especially for <em>XAU/USD</em>).</li>
+      <li><strong>Contact:</strong> If errors persist, email <a href="mailto:ruize.han@loethberg.com">ruize.han@loethberg.com</a>.</li>
+    </ul>
+  </div>
+
   <form id="data-form">
     <!-- Date Range -->
     <label for="from_date">From Date:</label>
@@ -175,8 +203,7 @@
   </div>
 
   <script>
-    // Enforce that volume is only valid if symbol==XAU/USD and user chooses "volume" radio.
-    // Otherwise, set top-of-book.
+    // Enforce volume or top-of-book usage
     const symbolSelect = document.getElementById('symbol');
     const tradeVolInput = document.getElementById('trade_vol');
     const radioVolume = document.getElementById('radio_volume');
@@ -185,17 +212,13 @@
     function enforceVolumeOrTOB() {
       const sym = symbolSelect.value;
       if (sym === 'XAU/USD') {
-        // Enable both radio buttons, let user pick.
+        // Enable both
         radioVolume.disabled = false;
         radioTOB.disabled = false;
-        // If user chooses volume, enable tradeVolInput, else disable it
-        if (radioVolume.checked) {
-          tradeVolInput.disabled = false;
-        } else {
-          tradeVolInput.disabled = true;
-        }
+        // If user chooses volume, enable volume input
+        tradeVolInput.disabled = !radioVolume.checked;
       } else {
-        // Only top-of-book is allowed, so force top-of-book
+        // Force top-of-book
         radioVolume.checked = false;
         radioTOB.checked = true;
         radioVolume.disabled = true;
@@ -204,65 +227,51 @@
       }
     }
 
-    // On symbol change, enforce the rule
     symbolSelect.addEventListener('change', enforceVolumeOrTOB);
-
-    // On radio button change, toggle volume input
     [radioVolume, radioTOB].forEach(r => {
       r.addEventListener('change', () => {
-        if (radioVolume.checked) {
-          tradeVolInput.disabled = false;
-        } else {
-          tradeVolInput.disabled = true;
-        }
+        tradeVolInput.disabled = !radioVolume.checked;
       });
     });
+    enforceVolumeOrTOB(); // initial
 
-    // Initialize
-    enforceVolumeOrTOB();
-
-    // Form Submit
+    // Submit form
     document.getElementById('data-form').addEventListener('submit', async function(e) {
       e.preventDefault();
-
       const formData = new FormData(e.target);
-      // We only have radio buttons for order_type, but our server expects:
-      //   top_of_book = 'on' or 'off'
-      //   trade_vol
-      // Let's set them properly:
+
+      // Server expects 'top_of_book' = 'on' or 'off'
       if (radioTOB.checked) {
         formData.set('top_of_book', 'on');
       } else {
         formData.set('top_of_book', 'off');
       }
 
-      // Done, now do the POST
       try {
         const response = await axios.post('/get_data', formData);
         const data = response.data;
         if (data.status === 'success') {
           document.getElementById('result').style.display = 'block';
 
-          // 1. Main Time Plot
+          // Main time plot
           document.getElementById('main_time_plot').src = data.main_time_plot;
 
-          // 2. Distribution / Outlier
+          // Distribution
           document.getElementById('dist_normal').src = data.distribution_plots.hist_normal;
           document.getElementById('dist_log').src = data.distribution_plots.hist_log;
           document.getElementById('dist_outlier').src = data.distribution_plots.outlier;
 
-          // 3. Hourly Plots => populate date/hour dropdown
-          const hourlyPlots = data.hourly_plots;  // { date: { hour: plot } }
+          // Hourly
+          const hourlyPlots = data.hourly_plots;
           const dateSelect = document.getElementById('select_date');
           const hourSelect = document.getElementById('select_hour');
           const hourlyPlotImg = document.getElementById('hourly_plot');
 
-          // Clear out existing options
+          // Clear old
           dateSelect.innerHTML = '';
           hourSelect.innerHTML = '';
           hourlyPlotImg.src = '';
 
-          // Build date options
           const allDates = Object.keys(hourlyPlots).sort();
           allDates.forEach(d => {
             const opt = document.createElement('option');
@@ -271,7 +280,6 @@
             dateSelect.appendChild(opt);
           });
 
-          // On date change, repopulate hours
           dateSelect.addEventListener('change', () => {
             const selectedDate = dateSelect.value;
             const hoursObj = hourlyPlots[selectedDate];
@@ -282,11 +290,9 @@
               optHr.textContent = hr;
               hourSelect.appendChild(optHr);
             });
-            // Clear image
             hourlyPlotImg.src = '';
           });
 
-          // On hour change, update image
           hourSelect.addEventListener('change', () => {
             const selectedDate = dateSelect.value;
             const selectedHour = hourSelect.value;
@@ -295,11 +301,10 @@
             }
           });
 
-          // Trigger default date to populate hours
+          // Initialize first date/hour
           if (allDates.length > 0) {
             dateSelect.value = allDates[0];
             dateSelect.dispatchEvent(new Event('change'));
-            // Then set hour select to first hour
             const firstHours = Object.keys(hourlyPlots[allDates[0]]).sort((a,b)=>parseInt(a)-parseInt(b));
             if (firstHours.length > 0) {
               hourSelect.value = firstHours[0];
@@ -307,7 +312,7 @@
             }
           }
 
-          // 4. Statistics
+          // Stats
           const stats = data.statistics;
           // Describe default
           const describeDefaultBody = document.querySelector('#describe-default tbody');
