@@ -13,34 +13,93 @@ import matplotlib.pyplot as plt
 import io
 import base64
 
-def get_quote_data(date_from, date_to, symbol, use_ssh=True):
+def get_quote_data(date_from, date_to, symbol, use_ssh=False):
     """
-    Fetch quote data for a specific date range (YYYY-MM-DD) and symbol from Alp_Quotes.
+    Fetch quote data for a specific date range (YYYY-MM-DD) and symbol from Alp_Quotes or local storage.
     
-    - Handles multiple partitions if date_from and date_to span different months.
+    - If all required local `.pkl` files exist for the date range and symbol, load data from local files.
+    - Otherwise, fetch data from the database, handling multiple partitions if necessary.
     - Allows connecting directly to the DB or via SSH based on the use_ssh flag.
     
     Parameters:
         date_from (str): Start date in 'YYYY-MM-DD' format.
         date_to (str): End date in 'YYYY-MM-DD' format.
         symbol (str): The symbol to fetch data for.
-        use_ssh (bool): Whether to connect via SSH. Default is True.
+        use_ssh (bool): Whether to connect via SSH. Default is False.
     
     Returns:
         pd.DataFrame: DataFrame containing the fetched quote data, or None if an error occurs.
     """
     try:
         # -------------------------------
-        # 1. Transform symbol for SQL query
+        # 1. Transform symbol for SQL query and local file
         # -------------------------------
         symbol_transformed = symbol.replace('/', '')
+        print(f"Transformed symbol: {symbol_transformed}")
 
         # -------------------------------
-        # 2. Determine all relevant partitions
+        # 2. Generate list of all dates in the range
         # -------------------------------
         from_date_ts = pd.Timestamp(date_from)
         to_date_ts = pd.Timestamp(date_to)
+        all_dates = pd.date_range(start=from_date_ts, end=to_date_ts, freq='D')
+        date_strings = all_dates.strftime('%Y-%m-%d').tolist()
+        print(f"Date range: {date_strings}")
 
+        # -------------------------------
+        # 3. Check for local data availability
+        # -------------------------------
+        local_data_available = True
+        local_dataframes = []
+        for date_str in date_strings:
+            file_path = os.path.join('Data', f"{symbol_transformed}_{date_str}.pkl")
+            if not os.path.exists(file_path):
+                print(f"Local file missing: {file_path}")
+                local_data_available = False
+                break
+            else:
+                print(f"Loading local file: {file_path}")
+                try:
+                    df_local = pd.read_pickle(file_path)
+                    # Select relevant columns
+                    df_local = df_local[[
+                        "MakerId",
+                        "CoreSymbol",
+                        "TimeRecorded",
+                        "Depth",
+                        "Side",
+                        "Price",
+                        "Size",
+                    ]]
+                    local_dataframes.append(df_local)
+                except Exception as e:
+                    print(f"Error loading {file_path}: {str(e)}")
+                    local_data_available = False
+                    break
+
+        if local_data_available:
+            print("All local data files found. Loading data from local storage.")
+            if local_dataframes:
+                result_df = pd.concat(local_dataframes, ignore_index=True)
+                print(f"Loaded {len(result_df)} rows from local files.")
+                return result_df
+            else:
+                print("No data found in local files for the specified range.")
+                return pd.DataFrame(columns=[
+                    "MakerId",
+                    "CoreSymbol",
+                    "TimeRecorded",
+                    "Depth",
+                    "Side",
+                    "Price",
+                    "Size",
+                ])
+        else:
+            print("Local data not fully available. Proceeding to fetch data from the database.")
+
+        # -------------------------------
+        # 4. Determine all relevant partitions
+        # -------------------------------
         month_map = {
             1: "jan", 2: "feb", 3: "mar", 4: "apr", 5: "may", 6: "jun",
             7: "jul", 8: "aug", 9: "sep", 10: "oct", 11: "nov", 12: "dec"
@@ -62,19 +121,20 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=True):
         print(f"Identified partitions: {all_partitions}")
 
         # -------------------------------
-        # 3. Build time filter boundaries
+        # 5. Build time filter boundaries
         # -------------------------------
         start_str = from_date_ts.strftime("%Y-%m-%d 00:00:00")
         end_str = to_date_ts.strftime("%Y-%m-%d 00:00:00")
+        print(f"Time filter: {start_str} to {end_str}")
 
         # -------------------------------
-        # 4. Database Connection Parameters
+        # 6. Database Connection Parameters
         # -------------------------------
         ssh_host = '18.133.184.11'
         ssh_user = 'ubuntu'
         ssh_key_file = '/Users/jackhan/Desktop/Alpfin/OneZero_Data.pem'
 
-        db_host_direct = 'your_direct_db_host'  # Replace with actual direct DB host
+        db_host_direct = '127.0.0.1'  # Replace with actual direct DB host
         db_host_via_ssh = '127.0.0.1'  # DB host when connecting via SSH
         db_port = 3306
         db_user = 'Ruize'
@@ -92,7 +152,7 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=True):
         ]
 
         # -------------------------------
-        # 5. Build the SQL query for each partition
+        # 7. Build the SQL query for each partition
         # -------------------------------
         queries = []
         for partition in all_partitions:
@@ -113,9 +173,9 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=True):
                     AND TimeRecorded < '{end_str}';
             """
             queries.append(query)
-
+        
         # -------------------------------
-        # 6. Connect to the database
+        # 8. Connect to the database and fetch data
         # -------------------------------
         if use_ssh:
             # SSH connection parameters
@@ -128,6 +188,7 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=True):
                 host_pkey_directories=[],  # Disable loading keys from ~/.ssh
             ) as tunnel:
                 local_port = tunnel.local_bind_port
+                print(f"SSH Tunnel established on local port {local_port}")
                 connection = pymysql.connect(
                     host='127.0.0.1',
                     port=local_port,
@@ -146,7 +207,7 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=True):
                     # Execute each query and collect results
                     dataframes = []
                     for q in queries:
-                        print(q)
+                        print(f"Executing query:\n{q}")
                         cursor.execute(q)
                         rows = cursor.fetchall()
                         print(f"Fetched {len(rows)} rows from partition.")
@@ -156,15 +217,17 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=True):
                     # Concatenate all DataFrames
                     if dataframes:
                         result_df = pd.concat(dataframes, ignore_index=True)
+                        print(f"All data fetched and concatenated. Total rows: {len(result_df)}")
                     else:
                         result_df = pd.DataFrame(columns=columns)
+                        print("No data fetched from database.")
                     
-                    print("All data fetched and concatenated.")
                     return result_df
 
                 finally:
                     cursor.close()
                     connection.close()
+                    print("Database connection via SSH closed.")
         else:
             # Direct DB connection parameters
             connection = pymysql.connect(
@@ -175,7 +238,6 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=True):
                 database=db_name,
                 connect_timeout=10
             )
-
             try:
                 print("Establishing DB Connection directly")
                 cursor = connection.cursor()
@@ -184,6 +246,7 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=True):
                 # Execute each query and collect results
                 dataframes = []
                 for q in queries:
+                    print(f"Executing query:\n{q}")
                     cursor.execute(q)
                     rows = cursor.fetchall()
                     print(f"Fetched {len(rows)} rows from partition.")
@@ -193,22 +256,26 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=True):
                 # Concatenate all DataFrames
                 if dataframes:
                     result_df = pd.concat(dataframes, ignore_index=True)
+                    print(f"All data fetched and concatenated. Total rows: {len(result_df)}")
                 else:
                     result_df = pd.DataFrame(columns=columns)
+                    print("No data fetched from database.")
                 
-                print("All data fetched and concatenated.")
                 return result_df
 
             finally:
                 cursor.close()
                 connection.close()
+                print("Direct database connection closed.")
 
     except Exception as e:
         print(f"ERROR fetching data for {symbol} from {date_from} to {date_to}: {str(e)}")
         return None
+    
 
 
-def PointSpreadDisplay(df_input, trade_vol, date_range, maker_id="Britannia", top_of_book=False, symbol=""):
+    
+def PointSpreadDisplay(df_input, trade_vol, date_range, maker_id="Britannia", top_of_book=True, symbol="XAU/USD"):
     """
     Create:
       1) Main Point Diff Over Time plot (entire range).
