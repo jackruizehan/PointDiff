@@ -231,7 +231,7 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=False):
                         #     result_df = result_df.sample(n=MAX_ROWS, random_state=42)
                         #     print(f"DataFrame was sampled to {MAX_ROWS} rows to reduce memory usage.")
 
-                        print(f"All data fetched. Total rows after sampling: {len(result_df)}")
+                        print(f"All data fetched. Total rows: {len(result_df)}")
                     else:
                         result_df = pd.DataFrame(columns=columns)
                         print("No data fetched from database.")
@@ -269,15 +269,15 @@ def get_quote_data(date_from, date_to, symbol, use_ssh=False):
                     result_df = pd.concat(dataframes, ignore_index=True)
                     check_memory_usage()
 
-                    # --------------------------------
-                    #  Add row sampling if large
-                    # --------------------------------
-                    MAX_ROWS = 1_000_000
-                    if len(result_df) > MAX_ROWS:
-                        result_df = result_df.sample(n=MAX_ROWS, random_state=42)
-                        print(f"DataFrame was sampled to {MAX_ROWS} rows to reduce memory usage.")
+                    # # --------------------------------
+                    # #  Add row sampling if large
+                    # # --------------------------------
+                    # MAX_ROWS = 1_000_000
+                    # if len(result_df) > MAX_ROWS:
+                    #     result_df = result_df.sample(n=MAX_ROWS, random_state=42)
+                    #     print(f"DataFrame was sampled to {MAX_ROWS} rows to reduce memory usage.")
 
-                    print(f"All data fetched. Total rows after sampling: {len(result_df)}")
+                    print(f"All data fetched. Total rows: {len(result_df)}")
                 else:
                     result_df = pd.DataFrame(columns=columns)
                     print("No data fetched from database.")
