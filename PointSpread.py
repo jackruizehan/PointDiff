@@ -1,10 +1,10 @@
-# PointSpread.py
 import os
 import pymysql
 import pandas as pd
 import time
 import numpy as np
 import seaborn as sns
+from sshtunnel import SSHTunnelForwarder
 
 import matplotlib
 matplotlib.use('Agg')  # Use a non-GUI backend
@@ -13,113 +13,198 @@ import matplotlib.pyplot as plt
 import io
 import base64
 
-def get_quote_data(date_from, date_to, symbol):
+def get_quote_data(date_from, date_to, symbol, use_ssh=True):
     """
-    Fetch quote data for a specific date (YYYY-MM-DD) and symbol from Alp_Quotes.
-    - Checks if data already exists locally; if so, load from file.
-    - Otherwise, fetch from the AWS server, then save locally.
+    Fetch quote data for a specific date range (YYYY-MM-DD) and symbol from Alp_Quotes.
+    
+    - Handles multiple partitions if date_from and date_to span different months.
+    - Allows connecting directly to the DB or via SSH based on the use_ssh flag.
+    
+    Parameters:
+        date_from (str): Start date in 'YYYY-MM-DD' format.
+        date_to (str): End date in 'YYYY-MM-DD' format.
+        symbol (str): The symbol to fetch data for.
+        use_ssh (bool): Whether to connect via SSH. Default is True.
+    
+    Returns:
+        pd.DataFrame: DataFrame containing the fetched quote data, or None if an error occurs.
     """
-    # -------------------------------
-    # 0. Ensure the Data directory exists
-    # -------------------------------
-    data_dir = 'Data'
-    if not os.path.exists(data_dir):
-        os.makedirs(data_dir)
-
-    # -------------------------------
-    # 1. Transform symbol for filename
-    # -------------------------------
-    symbol_transformed = symbol.replace('/', '')
-
-    # -------------------------------
-    # 2. Build the partition name
-    # -------------------------------
-    from_date_ts = pd.Timestamp(date_from)
-    to_date_ts  = pd.Timestamp(date_to)
-    # month_map = {
-    #     1: "jan", 2: "feb", 3: "mar", 4: "apr", 5: "may", 6: "jun",
-    #     7: "jul", 8: "aug", 9: "sep", 10: "oct", 11: "nov", 12: "dec"
-    # }
-    # partition_name = f"p_{month_map[date_ts.month]}_{date_ts.year}"
-
-    # -------------------------------
-    # 3. Build time filter boundaries
-    # -------------------------------
-    start_str = from_date_ts.strftime("%Y-%m-%d 00:00:00")
-    end_str = to_date_ts.strftime("%Y-%m-%d 00:00:00")
-
-    # -------------------------------
-    # 6. Build the SQL query
-    # -------------------------------
-    query = f"""
-        SELECT 
-            MakerId, 
-            CoreSymbol, 
-            TimeRecorded, 
-            Depth, 
-            Side, 
-            Price, 
-            Size,
-        FROM Alp_Quotes
-        FORCE INDEX (idx_time_recorded)
-        WHERE 
-            CoreSymbol = '{symbol}'
-            AND TimeRecorded >= '{start_str}'
-            AND TimeRecorded < '{end_str}';
-    """
-
-    # -------------------------------
-    # 7. Database Connection Parameters
-    # -------------------------------
-    db_host = '127.0.0.1'  # Assuming the DB is localhost
-    db_port = 3306
-    db_user = 'Ruize'
-    db_password = 'Ma5hedPotato567='
-    db_name = 'Alp_CPT_Data'
-
-    columns = [
-        "MakerId",
-        "CoreSymbol",
-        "TimeRecorded",
-        "Depth",
-        "Side",
-        "Price",
-        "Size",
-    ]
-
-    # -------------------------------
-    # 8. Direct MySQL Retrieval (No SSH)
-    # -------------------------------
     try:
-        connection = pymysql.connect(
-            host=db_host,
-            port=db_port,
-            user=db_user,
-            password=db_password,
-            database=db_name,
-            connect_timeout=10
-        )
+        # -------------------------------
+        # 1. Transform symbol for SQL query
+        # -------------------------------
+        symbol_transformed = symbol.replace('/', '')
 
-        try:
-            print("Establishing DB Connection")
-            cursor = connection.cursor()
-            print(f"Executing query for {symbol} on {date}...")
-            cursor.execute(query)
-            print("Query executed.")
-            rows = cursor.fetchall()
-            print("Data Fetched")
-            df = pd.DataFrame(rows, columns=columns)
+        # -------------------------------
+        # 2. Determine all relevant partitions
+        # -------------------------------
+        from_date_ts = pd.Timestamp(date_from)
+        to_date_ts = pd.Timestamp(date_to)
 
-            # Save locally
-            df.to_pickle(file_path)
-            return df
+        month_map = {
+            1: "jan", 2: "feb", 3: "mar", 4: "apr", 5: "may", 6: "jun",
+            7: "jul", 8: "aug", 9: "sep", 10: "oct", 11: "nov", 12: "dec"
+        }
 
-        finally:
-            cursor.close()
-            connection.close()
+        # Generate list of months between from_date and to_date inclusive
+        all_partitions = []
+        current = from_date_ts.replace(day=1)
+        end = to_date_ts.replace(day=1)
+        while current <= end:
+            partition_name = f"p_{month_map[current.month]}_{current.year}"
+            all_partitions.append(partition_name)
+            # Move to next month
+            if current.month == 12:
+                current = current.replace(year=current.year + 1, month=1)
+            else:
+                current = current.replace(month=current.month + 1)
+        
+        print(f"Identified partitions: {all_partitions}")
+
+        # -------------------------------
+        # 3. Build time filter boundaries
+        # -------------------------------
+        start_str = from_date_ts.strftime("%Y-%m-%d 00:00:00")
+        end_str = to_date_ts.strftime("%Y-%m-%d 00:00:00")
+
+        # -------------------------------
+        # 4. Database Connection Parameters
+        # -------------------------------
+        ssh_host = '18.133.184.11'
+        ssh_user = 'ubuntu'
+        ssh_key_file = '/Users/jackhan/Desktop/Alpfin/OneZero_Data.pem'
+
+        db_host_direct = 'your_direct_db_host'  # Replace with actual direct DB host
+        db_host_via_ssh = '127.0.0.1'  # DB host when connecting via SSH
+        db_port = 3306
+        db_user = 'Ruize'
+        db_password = 'Ma5hedPotato567='
+        db_name = 'Alp_CPT_Data'
+
+        columns = [
+            "MakerId",
+            "CoreSymbol",
+            "TimeRecorded",
+            "Depth",
+            "Side",
+            "Price",
+            "Size",
+        ]
+
+        # -------------------------------
+        # 5. Build the SQL query for each partition
+        # -------------------------------
+        queries = []
+        for partition in all_partitions:
+            query = f"""
+                SELECT 
+                    MakerId, 
+                    CoreSymbol, 
+                    TimeRecorded, 
+                    Depth, 
+                    Side, 
+                    Price, 
+                    Size
+                FROM Alp_Quotes PARTITION ({partition})
+                FORCE INDEX (idx_time_recorded)
+                WHERE 
+                    CoreSymbol = '{symbol}'
+                    AND TimeRecorded >= '{start_str}'
+                    AND TimeRecorded < '{end_str}';
+            """
+            queries.append(query)
+
+        # -------------------------------
+        # 6. Connect to the database
+        # -------------------------------
+        if use_ssh:
+            # SSH connection parameters
+            with SSHTunnelForwarder(
+                (ssh_host, 22),
+                ssh_username=ssh_user,
+                ssh_pkey=ssh_key_file,
+                remote_bind_address=(db_host_via_ssh, db_port),
+                allow_agent=False,
+                host_pkey_directories=[],  # Disable loading keys from ~/.ssh
+            ) as tunnel:
+                local_port = tunnel.local_bind_port
+                connection = pymysql.connect(
+                    host='127.0.0.1',
+                    port=local_port,
+                    user=db_user,
+                    password=db_password,
+                    database=db_name,
+                    connect_timeout=10
+
+                )
+
+                try:
+                    print("Establishing DB Connection via SSH")
+                    cursor = connection.cursor()
+                    print(f"Executing queries for {symbol} from {date_from} to {date_to}...")
+                    
+                    # Execute each query and collect results
+                    dataframes = []
+                    for q in queries:
+                        print(q)
+                        cursor.execute(q)
+                        rows = cursor.fetchall()
+                        print(f"Fetched {len(rows)} rows from partition.")
+                        df = pd.DataFrame(rows, columns=columns)
+                        dataframes.append(df)
+                    
+                    # Concatenate all DataFrames
+                    if dataframes:
+                        result_df = pd.concat(dataframes, ignore_index=True)
+                    else:
+                        result_df = pd.DataFrame(columns=columns)
+                    
+                    print("All data fetched and concatenated.")
+                    return result_df
+
+                finally:
+                    cursor.close()
+                    connection.close()
+        else:
+            # Direct DB connection parameters
+            connection = pymysql.connect(
+                host=db_host_direct,
+                port=db_port,
+                user=db_user,
+                password=db_password,
+                database=db_name,
+                connect_timeout=10
+            )
+
+            try:
+                print("Establishing DB Connection directly")
+                cursor = connection.cursor()
+                print(f"Executing queries for {symbol} from {date_from} to {date_to}...")
+                
+                # Execute each query and collect results
+                dataframes = []
+                for q in queries:
+                    cursor.execute(q)
+                    rows = cursor.fetchall()
+                    print(f"Fetched {len(rows)} rows from partition.")
+                    df = pd.DataFrame(rows, columns=columns)
+                    dataframes.append(df)
+                
+                # Concatenate all DataFrames
+                if dataframes:
+                    result_df = pd.concat(dataframes, ignore_index=True)
+                else:
+                    result_df = pd.DataFrame(columns=columns)
+                
+                print("All data fetched and concatenated.")
+                return result_df
+
+            finally:
+                cursor.close()
+                connection.close()
 
     except Exception as e:
-        print(f"ERROR fetching data for {symbol} from {from_date} to {to_date}: {str(e)}")
+        print(f"ERROR fetching data for {symbol} from {date_from} to {date_to}: {str(e)}")
         return None
 
 
